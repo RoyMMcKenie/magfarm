@@ -1,129 +1,48 @@
 # MagFarm
 
-**Version:** 0.1.1 
-**Purpose:** Safe read-only MacroQuest monitor for a Magician.
+Version: 0.3.5, including the save-diagnostics extension.
+Working branch: `monitor-baseline-v0.3.5`.
+Tested diagnostics code checkpoint: `cfb1359`.
 
-MagFarm 0.1.0 is intentionally **not** a farming bot. It displays live character, pet, target, casting, spell-readiness, and spell-gem information. Its only action is a manually requested **Stop All Movement** command.
+## Purpose and scope
 
-## Installation
+MagFarm is a MacroQuest Magician monitor with explicit manual safety controls. It displays character, local-group roster, independent stacked group roles, pet, target, casting, readiness and twelve spell-gem slots. It does not automatically select targets, cast, attack, engage pets, start character travel/navigation, loot, manage inventory or assign group roles. Raid collection is not implemented.
 
-1. Find the Lua scripts folder used by your currently active MacroQuest installation.
-2. Create a folder named:
+The manual controls are Stop All Movement, Pet Back Off and Pet Follow. Their requests are dispatched from the main loop, not from the ImGui render callback. A selected NPC or a red resource value does not authorize a game action.
 
-   ```text
-   magfarm
-   ```
+## Repository and installation layout
 
-3. Place all MagFarm files inside that folder.
-4. Start the package in-game:
+The repository root contains `init.lua`, `config.lua`, `state.lua`, `movement.lua`, `ui.lua` and documentation. There is no nested package folder inside the repository. Place or clone the repository root at the active MacroQuest Lua scripts directory's `magfarm` folder. The installed folder itself must still be named `magfarm`, because the code imports `magfarm.ui`, `magfarm.config`, `magfarm.state` and `magfarm.movement`.
 
-   ```text
-   /lua run magfarm
-   ```
-
-The package does not contain a hard-coded EverQuest path, MacroQuest path, drive letter, server name, or Windows user folder.
-
-## Commands
-
-| Command | Result |
-|---|---|
-| `/lua run magfarm` | Load MagFarm and open the monitor |
-| `/lua stop magfarm` | Stop the Lua package |
-| `/magfarm` | Toggle the monitor window |
-| `/magfarm show` | Show the monitor window |
-| `/magfarm hide` | Hide the monitor window |
-| `/magfarm stop` | Stop EasyFind travel, MQ2Nav navigation, and `/stick` |
-| `/magfarm quit` | Cleanly end MagFarm |
-| `/magfarm help` | Print command help |
-
-## Version 0.1.0 scope
-
-### Reads and displays
-
-- Character name, level, class, HP, mana, and zone
-- Pet name, ID, HP, distance, and idle/targeting state
-- Current target name, ID, level, HP, distance, type, and aggro holder
-- Current cast name and spell ID
-- Readiness of `Spear of Molten Arcronite`
-- Spell gems 1 through 12, including intentionally empty slots
-
-### Does not do
-
-- Start travel or navigation
-- Cast spells
-- Change or acquire targets
-- Attack
-- Issue pet commands
-- Loot
-- Manage inventory
-- Automate combat
-- Automate pulling
-- Make decisions from zone population data
-
-## Stop All Movement
-
-The UI button and `/magfarm stop` issue these verified commands:
+Start and stop these commands in EverQuest chat, not PowerShell:
 
 ```text
-/travelto stop
-/nav stop
-/stick off
+/lua run magfarm
+/lua stop magfarm
 ```
 
-These commands stop movement systems that are already active. MagFarm 0.1.0 never starts any of them.
+`/magfarm` toggles the monitor; `show` and `hide` control visibility; `stop` requests movement cancellation; `quit` requests clean shutdown; `help` prints available slash commands. Pet recovery controls are UI buttons.
 
-## Tested profile
+## Persistent display options
 
-The initial compatibility baseline was tested on:
+Open Options to change HP and Mana red-below thresholds. Defaults are 35% each. Values are validated, clamped to 0..100 and rounded. A known value turns red only when strictly below its threshold; equality is not red. Unknown resources remain neutral `--`. Remote mana is group-reported and has previously shown inaccurate readings.
 
-```text
-Character: 112 MAG
-Class: MAG
-Level: 112
-Test zone: Frontier Mountains
-Pet: summoned pet
-Spell-gem profile: 12 valid slots
-```
+Storage is `MagFarm_<encoded server>_<encoded character>.settings` in `mq.configDir`, not the Git working directory. Schema version remains 1. Settings are parsed as data, never executed. Writes occur in the main-loop tick and on clean shutdown. Reset always queues a save, even if values already match the defaults. Existing-file replacement uses temporary and backup files with a rollback attempt on replacement failure. Unknown schemas are preserved. Crash recovery from `.bak` is manual.
 
-See `COMPATIBILITY.md` for the precise tested interfaces and unsupported members.
+## Save diagnostics
 
-## Testing checklist
+Options distinguishes loaded values, pending values, successful saves and failures. A successful save shows a session-local counter, local date/time, actual HP/Mana thresholds and the storage path. Editing or resetting does not itself count as a successful write.
 
-1. Keep spell gem 12 empty for the first UI test.
-2. Run:
+The Activity Log receives settings load, edit, reset, save and failure events as well as manual-action events. Events are drained once per main-loop tick. The UI retains at most 20 entries; history and save counters restart with the Lua package. These diagnostics are not a persistent audit log.
 
-   ```text
-   /lua run magfarm
-   ```
+## Git workflow
 
-3. Confirm the MagFarm window opens.
-4. Confirm character, pet, target, casting, readiness, and gem data display.
-5. Confirm gem 12 appears as `Empty`.
-6. While idle, click **Stop All Movement**.
-7. Confirm nothing harmful happens.
-8. Toggle the window with:
+The active local MagFarm folder is the Git working copy. For a OneDrive-backed working folder, this user's setup keeps the Git database outside OneDrive. Its `.git` file points to a machine-local database; do not reuse that pointer on another computer.
 
-   ```text
-   /magfarm
-   ```
+Run Git commands in PowerShell from the working folder. To receive GitHub changes, stop MagFarm and use `git pull --ff-only`. To publish tested Lua edits, review `git status` and `git diff`, stage only intended files, commit, then push the working branch. Do not rerun the first-time clone or diagnostics installer after successful installation. Git synchronization is manual, not automatic. Never force an overwrite to resolve unexplained errors.
 
-9. Stop the package:
+## Validation and remaining work
 
-   ```text
-   /magfarm quit
-   ```
+On 2026-10-06, the user confirmed startup, edited HP=40/Mana=46 surviving restart, and reset values of 35/35 surviving restart on the pre-diagnostics v0.3.5 baseline. After the diagnostics extension, the user confirmed a loaded-values event, a prompt Mana edit event and a successful save display for HP=35/Mana=36. The two-file diagnostics update was committed and pushed as `cfb1359`.
 
-## Safety rule
-
-Do not add movement, casting, pet, targeting, or combat behavior to MagFarm without first verifying the exact MacroQuest interface in the active installation and testing that behavior in a safe environment.
-
-## v0.1.1 monitor behavior
-
-MagFarm v0.1.1 adds only observability:
-
-- Target safety classification based on the verified `Target.Type` member.
-- User-editable, read-only `Me.SpellReady[spell name]` display.
-- A local in-window MagFarm activity log.
-
-It does not add any casting, targeting, pet-control, travel-start, navigation-start,
-combat, loot, or inventory behavior.
+Failure injection, crash recovery, cross-character isolation, all role combinations and threshold-colour boundary tests are not established by these screenshots. Automatic startup plugin verification is not yet implemented. Consult `COMPATIBILITY.md` for the historical tested-interface record; it is not a complete current-feature description. `INSTALL-v0.3.5.txt` is retained as the earlier persistence-install note; this README describes the current Git layout.

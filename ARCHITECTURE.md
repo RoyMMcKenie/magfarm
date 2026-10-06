@@ -1,86 +1,39 @@
-<!--
-  FILE    : magfarm/ARCHITECTURE.md
-  PACKAGE : MagFarm Lua (MacroQuest / EverQuest)
-  VERSION : 0.1.0
-  WHAT    : Maintainer map of MagFarm modules, state flow, boundaries, and safe editing rules.
-  WHY     : Lets a future maintainer understand the design without reverse engineering source.
-  WHERE   : Package root beside init.lua.
-  WHEN    : Read before changing package behavior.
--->
-
 # MagFarm architecture
 
-## Start here
+Scope: the current v0.3.5 monitor branch with save diagnostics. This document replaces architecture descriptions from the earlier legacy attempt.
 
-1. `init.lua` loads configuration, registers `/magfarm`, registers ImGui, and runs the outer loop.
-2. `ui.lua` only renders status and requests actions. It must never wait.
-3. `state.lua` owns Start, Pause, Resume, Stop, mode selection, and one non-blocking state tick.
-4. `runtime.lua` owns live state; it is never saved.
-5. `config.lua` owns persisted settings and validation.
-6. Specialized modules report decisions upward; none independently starts combat or movement.
+## Module responsibilities
 
-## Module map
+| Root file | Responsibility |
+|---|---|
+| `init.lua` | Require UI/config, initialize settings, bind `/magfarm`, register the ImGui callback, run the 100 ms loop and flush on clean shutdown. |
+| `config.lua` | Validate thresholds, load/save schema-1 character settings, describe pending/completed results and queue bounded diagnostic events. |
+| `state.lua` | Collect read-only character, numeric group-slot roster, independent role flags, pet, target, casting, readiness and spell-gem snapshots. |
+| `movement.lua` | Dispatch existing explicitly requested movement cancellation and pet recovery commands. |
+| `ui.lua` | Render the monitor and Options, enqueue manual requests, flush settings and consume diagnostic events in tick, and show bounded activity history. |
 
-| File | One job | Requires |
-|---|---|---|
-| `init.lua` | Startup, commands, main loop, clean shutdown | all modules |
-| `runtime.lua` | Runtime state, status, log, camp data | none |
-| `utils.lua` | Logging, command dispatch, timers, helpers | mq |
-| `config.lua` | Defaults, load/save, validation | mq, utils |
-| `state.lua` | State transitions and policy orchestration | config, runtime, utils, modules |
-| `spells.lua` | Spellbook scan, role picks, upgrade recommendations | mq, config, runtime, utils |
-| `assist.lua` | Group/Main Assist status foundation | mq, config, runtime, utils |
-| `pet.lua` | Pet status and future taunt/attack policy | mq, config, runtime, utils |
-| `merc.lua` | Mercenary status and future policy | mq, config, runtime, utils |
-| `follow.lua` | Follow-leader validation and future navigation policy | mq, config, runtime, utils |
-| `spell_acquisition.lua` | Scan-only vendor/inventory plan foundation | mq, config, runtime, spells, utils |
-| `ui.lua` | ImGui controls and display only | mq, ImGui, modules |
-| `dev/doc_audit.py` | Offline documentation-standard audit | Python |
-| `dev/smoke_test.py` | Offline structure/configuration smoke test | Python |
+## Runtime flow
 
-## State flow
+The repository root maps to the installed `lua/magfarm` directory. Package imports keep the `magfarm.` prefix; removing the redundant repository subfolder did not require removing that prefix.
 
-```text
-IDLE
-  -> PREPARE       Start requested
-PREPARE
-  -> MANUAL        Manual mode preflight passed
-  -> CAMP_IDLE     Camp mode preflight passed
-  -> FOLLOW        Follow mode preflight passed
-  -> PAUSED        Preflight failed
-MANUAL / CAMP_IDLE / FOLLOW
-  -> PAUSED        Operator pause or safety condition
-  -> IDLE          Operator stop
-PAUSED
-  -> prior state   Operator resume
-```
+Startup loads server/character settings before UI registration. The main loop calls `ui.tick()` and yields 100 ms while in-game. A visible monitor frame obtains a snapshot through `state.capture()`. Options updates validated in-memory values only.
 
-Camp pulling, defensive fallback, pet release, mercenary control, and combat are intentionally reserved for later versions. The state names are present now so their later addition does not require replacing the architecture.
+On tick, config flushes pending values, then the UI drains settings events once into its Activity Log. Explicit manual requests are dispatched separately through movement helpers. Closing or hiding the monitor does not turn its observed data into action triggers.
 
-## Invariants
+## Persistence and diagnostics
 
-- UI callbacks do not call `mq.delay` or run multi-step game jobs.
-- A group Main Assist owns group target selection.
-- Without a valid Main Assist, group offense is disabled.
-- Any safety exception must stay scoped to an already validated active pull target.
-- No module may require a higher-level module and create a require cycle.
-- Settings belong in `config.DEFAULTS`; live state belongs in `runtime.lua`.
+Two resource thresholds share one configuration source. Defaults are HP=35 and Mana=35. Missing optional values retain defaults; valid loaded values use the same validation path as edits without generating operator-edit events.
 
-## Future spell maintenance
+Data lives under `mq.configDir`, with a filename derived from encoded server and character identity. Schema-1 text remains compatible with the previously tested settings files. The temporary/backup/rename algorithm is unchanged by diagnostics. Unsupported schemas block overwriting. Save failures retain in-memory edits but clear the automatic retry flag; another edit or explicit reset can queue a new attempt.
 
-Spell role candidates live in `spells.lua`, in best-first order. Add a newly preferred spell above older candidates, run `/magfarm spells`, review the recommendation, and update `CHANGELOG.md`.
+The status distinguishes pending memory values from the last completed result. Save counts increase only after a successful final rename and are session-local. Timestamps use local wall-clock time. The configuration event queue and UI Activity Log are bounded to 20 entries each. Reading status performs no file I/O, and draining events clears the pending queue.
 
-## Documentation standard
+## Data and action boundaries
 
-Every Lua file has a header, footer, What/Why/Where/How/When function blocks, and line-level code documentation. Run:
+Group.Member numeric slots 0..5 are the roster source. Independent roles may overlap; missing role telemetry stays unknown. Missing numeric resources remain nil rather than silently becoming zero. Remote mana remains group-reported. Raid data is not collected.
 
-```text
-python dev/doc_audit.py
-python dev/smoke_test.py
-```
+Automatic combat, casting, pet engagement, targeting, character travel/navigation, loot, inventory and role assignment remain outside the implemented scope. Startup plugin inventory and conflict/readiness reporting remain future work; command availability is not currently guaranteed by startup validation.
 
-before considering an edit complete.
+## Documentation rule
 
-<!--
-  END OF FILE : magfarm/ARCHITECTURE.md
--->
+Every code file must retain a documentation header and footer. Every function must describe what, why, where, how and when. Comments describing safety, persistence or implemented features must match actual behavior rather than intended future behavior.
