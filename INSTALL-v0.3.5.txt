@@ -1,0 +1,16 @@
+MagFarm v0.3.5 — Persistence update
+
+INSTALL
+Stop MagFarm. Back up your current folder. Replace config.lua, ui.lua and init.lua with these three files. Keep your tested state.lua and movement.lua unchanged. Start /lua run magfarm.
+
+STORAGE
+Display settings use MagFarm_<encoded server>_<encoded character>.settings in MacroQuest's configured config directory. Schema version is 1. Data is parsed as text, never executed. The previous successful file is retained as .bak after replacement. Defaults remain 35/35. Missing/invalid individual values retain defaults; finite values are clamped and rounded. Unknown schemas are not overwritten.
+
+TEST
+Set HP=40 and Mana=45. Wait a main-loop tick and confirm Options reports Saved. Stop and restart; verify 40/45 reload. Reset defaults; restart and verify 35/35. Confirm another character uses its own settings. Confirm mana below a threshold remains red, equality remains normal, and roles still stack.
+
+ERRORS
+Save failures appear in Options. In-memory edits remain active; edit/reset again to retry. Failed writes do not intentionally replace the previous settings file. Unreadable files use defaults and report creation-on-edit behavior. Crash recovery from .bak is manual. No automatic combat, casting, targeting, movement or pet engagement is added.
+
+VALIDATION
+Generated and statically checked only. MacroQuest/Lua runtime testing is required; no in-game execution was available here.
