@@ -1,6 +1,6 @@
 --[[
 ==============================================================================
-FILE    : magfarm/ui.lua
+FILE    : ui.lua
 PACKAGE : MagFarm
 VERSION : 0.3.5
 
@@ -66,7 +66,7 @@ local stopAllRequested = false
 local petBackOffRequested = false
 local petFollowRequested = false
 
---- Bounded manual-action history.
+--- Bounded history of explicit manual actions and settings diagnostics.
 local LOG_MAX = 20
 local activityLog = {}
 
@@ -221,16 +221,21 @@ end
 --[[
 ------------------------------------------------------------------------------
 FUNCTION : ui.tick()
-WHAT : Dispatches explicitly queued manual requests.
+WHAT : Flushes settings, records their diagnostics, and dispatches manual requests.
 WHY : Keeps command side effects outside rendering.
 WHERE : Existing main loop.
-HOW : Clears flags and invokes existing movement helpers.
+HOW : Flushes, drains settings events once, then invokes queued movement helpers.
 WHEN : Each package-loop pass.
 SAFETY : No observed state can initiate an action.
 ------------------------------------------------------------------------------
 ]]
 function ui.tick()
     config.flush()
+    -- WHAT: Consume settings results once; WHY: make saves visible in the log.
+    -- WHERE: Main-loop tick; HOW: drain the bounded queue; WHEN: after flush.
+    for _, event in ipairs(config.drainEvents()) do
+        logEvent(event)
+    end
     if stopAllRequested then
         stopAllRequested = false
         movement.stopAll()
@@ -704,7 +709,7 @@ end
 --[[
 ------------------------------------------------------------------------------
 FUNCTION : drawLog()
-WHAT : Displays bounded manual-action history.
+WHAT : Displays bounded manual-action and settings history.
 WHY : Keeps package-originated actions auditable.
 WHERE : Activity Log panel.
 HOW : Uses a child region and always balances BeginChild/EndChild.
@@ -778,7 +783,7 @@ return ui
 
 --[[
 ==============================================================================
-FOOTER : magfarm/ui.lua
+FOOTER : ui.lua
 VERSION : 0.3.5
 
 EXPORTS :
@@ -813,7 +818,10 @@ OPTIONS :
   Button-accessible separate window.
   HP and Mana thresholds default to 35%.
   Values are persistent, validated, and clamped to 0..100.
-  Persistence implemented; no behavior controls added.
+  Persistence implemented; save time, values, counter and pending status shown.
+  Activity Log receives edit, reset, load, save and failure events once per tick.
+  Save counters and activity history reset when the Lua package restarts.
+  No gameplay behavior controls added.
 
 SAFETY :
   Existing explicit manual controls only.
