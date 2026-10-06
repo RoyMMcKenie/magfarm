@@ -1,81 +1,129 @@
-<!--
-  FILE    : magfarm/README.md
-  PACKAGE : MagFarm Lua (MacroQuest / EverQuest)
-  VERSION : 0.1.0
-  WHAT    : Installation, operation, safety, and troubleshooting guide.
-  WHY     : Lets an operator use the package without reading source code.
-  WHERE   : Package root beside init.lua.
-  WHEN    : Read before the first in-game run and after every upgrade.
--->
-
 # MagFarm
 
-MagFarm is a documented MacroQuest Lua package for a Magician. It is designed as a controlled camp/follow assistant with explicit group Main Assist ownership, pet and mercenary pull discipline, spell-role selection, and future spell acquisition support.
+**Version:** 0.1.1 
+**Purpose:** Safe read-only MacroQuest monitor for a Magician.
 
-## Status: 0.1.0 foundation
+MagFarm 0.1.0 is intentionally **not** a farming bot. It displays live character, pet, target, casting, spell-readiness, and spell-gem information. Its only action is a manually requested **Stop All Movement** command.
 
-Version 0.1.0 intentionally provides the observable control core before autonomous pulling:
+## Installation
 
-- Manual, Camp, and Follow modes
-- Start, Pause, Resume, Stop, and Set Camp controls
-- Character/server-specific settings
-- Magician class preflight
-- Spellbook role detection and manual role overrides
-- Group/Main Assist status warning foundation
-- Pet and mercenary status foundation
-- Spell Acquisition scan-only preview foundation
-- Rolling activity log and debug trace
+1. Find the Lua scripts folder used by your currently active MacroQuest installation.
+2. Create a folder named:
 
-It does **not** yet buy/scribe scrolls, issue offensive combat commands, control mercenary stances, or autonomously pull. Those features are staged after client-specific command paths are tested.
+   ```text
+   magfarm
+   ```
 
-## Install
+3. Place all MagFarm files inside that folder.
+4. Start the package in-game:
 
-Place the folder named exactly `magfarm` inside your MacroQuest Lua folder:
+   ```text
+   /lua run magfarm
+   ```
 
-```text
-<MacroQuest>/lua/magfarm/
-    init.lua  runtime.lua  state.lua  config.lua  utils.lua
-    spells.lua  assist.lua  pet.lua  merc.lua  follow.lua
-    spell_acquisition.lua  ui.lua
-    README.md  ARCHITECTURE.md  ATTRIBUTION.md  CHANGELOG.md
-```
-
-Run:
-
-```text
-/lua run magfarm
-```
+The package does not contain a hard-coded EverQuest path, MacroQuest path, drive letter, server name, or Windows user folder.
 
 ## Commands
 
-| Command | Action |
+| Command | Result |
 |---|---|
-| `/magfarm` | Toggle the MagFarm window |
-| `/magfarm start` | Start using the configured mode |
-| `/magfarm stop` | Stop safely and return to Idle |
-| `/magfarm pause` | Pause and stop movement |
-| `/magfarm resume` | Resume the state saved by Pause |
-| `/magfarm camp` | Save the current location as camp |
-| `/magfarm mode manual` | Use Manual mode |
-| `/magfarm mode camp` | Use Camp mode |
-| `/magfarm mode follow` | Use Follow mode |
-| `/magfarm spells` | Rescan spellbook and show role selections |
-| `/magfarm acquire scan` | Scan open merchant/inventory in preview mode |
-| `/magfarm status` | Print current state and key safety status |
-| `/magfarm quit` | Save settings and end cleanly |
+| `/lua run magfarm` | Load MagFarm and open the monitor |
+| `/lua stop magfarm` | Stop the Lua package |
+| `/magfarm` | Toggle the monitor window |
+| `/magfarm show` | Show the monitor window |
+| `/magfarm hide` | Hide the monitor window |
+| `/magfarm stop` | Stop EasyFind travel, MQ2Nav navigation, and `/stick` |
+| `/magfarm quit` | Cleanly end MagFarm |
+| `/magfarm help` | Print command help |
 
-## Safety model
+## Version 0.1.0 scope
 
-- When grouped, a valid Main Assist owns hostile target selection.
-- Without a valid Main Assist, offensive group automation stays disabled.
-- Solo or Magician-Main-Assist camp behavior is planned for the camp-pull milestone.
-- Pet and mercenary emergency behavior is planned but remains disabled until its command interface is verified on the live client.
-- Closing the window does not stop the script. Use Pause or Stop.
+### Reads and displays
 
-## Credits
+- Character name, level, class, HP, mana, and zone
+- Pet name, ID, HP, distance, and idle/targeting state
+- Current target name, ID, level, HP, distance, type, and aggro holder
+- Current cast name and spell ID
+- Readiness of `Spear of Molten Arcronite`
+- Spell gems 1 through 12, including intentionally empty slots
 
-Spell Acquisition is a clean Lua adaptation of the workflow in `scribe.mac`, originally authored by Sym. The supplied source credits Chatwiththisname, Lemons, and Sic for later contributions. See `ATTRIBUTION.md`.
+### Does not do
 
-<!--
-  END OF FILE : magfarm/README.md
--->
+- Start travel or navigation
+- Cast spells
+- Change or acquire targets
+- Attack
+- Issue pet commands
+- Loot
+- Manage inventory
+- Automate combat
+- Automate pulling
+- Make decisions from zone population data
+
+## Stop All Movement
+
+The UI button and `/magfarm stop` issue these verified commands:
+
+```text
+/travelto stop
+/nav stop
+/stick off
+```
+
+These commands stop movement systems that are already active. MagFarm 0.1.0 never starts any of them.
+
+## Tested profile
+
+The initial compatibility baseline was tested on:
+
+```text
+Character: 112 MAG
+Class: MAG
+Level: 112
+Test zone: Frontier Mountains
+Pet: summoned pet
+Spell-gem profile: 12 valid slots
+```
+
+See `COMPATIBILITY.md` for the precise tested interfaces and unsupported members.
+
+## Testing checklist
+
+1. Keep spell gem 12 empty for the first UI test.
+2. Run:
+
+   ```text
+   /lua run magfarm
+   ```
+
+3. Confirm the MagFarm window opens.
+4. Confirm character, pet, target, casting, readiness, and gem data display.
+5. Confirm gem 12 appears as `Empty`.
+6. While idle, click **Stop All Movement**.
+7. Confirm nothing harmful happens.
+8. Toggle the window with:
+
+   ```text
+   /magfarm
+   ```
+
+9. Stop the package:
+
+   ```text
+   /magfarm quit
+   ```
+
+## Safety rule
+
+Do not add movement, casting, pet, targeting, or combat behavior to MagFarm without first verifying the exact MacroQuest interface in the active installation and testing that behavior in a safe environment.
+
+## v0.1.1 monitor behavior
+
+MagFarm v0.1.1 adds only observability:
+
+- Target safety classification based on the verified `Target.Type` member.
+- User-editable, read-only `Me.SpellReady[spell name]` display.
+- A local in-window MagFarm activity log.
+
+It does not add any casting, targeting, pet-control, travel-start, navigation-start,
+combat, loot, or inventory behavior.
