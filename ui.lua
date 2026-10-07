@@ -1,303 +1,875 @@
---[[==========================================================================
-  FILE        : magfarm/ui.lua
-  PACKAGE     : MagFarm Lua  (MacroQuest / EverQuest)
-  VERSION     : 0.1.0
-  CHANGES     : 0.1.0  Initial non-blocking control/status window.
+--[[
+==============================================================================
+FILE    : ui.lua
+PACKAGE : MagFarm
+VERSION : 0.3.6
 
-  WHAT  : Renders MagFarm's ImGui controls, live status, spell roles, settings,
-          Spell Acquisition preview, and rolling log.
-  WHY   : Operators need visible, explainable automation states and safe controls
-          without putting game jobs or waits inside an ImGui callback.
-  WHERE : Registered by init.lua through mq.imgui.init.
-  HOW   : Reads runtime/config/module status and requests actions through state.
-  WHEN  : Every client frame while the window is visible.
-==========================================================================]]--
+WHAT :
+Displays the monitor, independent stacked group roles, configurable resource
+colours, persistent Options, and cached startup/plugin readiness.
 
-local mq = require('mq') -- Current character/zone display TLOs.
-local ImGui = require('ImGui') -- MacroQuest immediate-mode UI library.
-local config = require('magfarm.config') -- Persistent settings fields.
-local runtime = require('magfarm.runtime') -- State, status, and log.
-local state = require('magfarm.state') -- Requested actions only.
-local spells = require('magfarm.spells') -- Role display.
-local assist = require('magfarm.assist') -- Group/Main Assist display.
-local pet = require('magfarm.pet') -- Pet display.
-local merc = require('magfarm.merc') -- Mercenary display.
-local follow = require('magfarm.follow') -- Follow display.
-local acquisition = require('magfarm.spell_acquisition') -- Acquisition preview display.
-local ui = {} -- Module export table.
+WHY :
+Group roles must be flexible. Resource thresholds must be configurable through
+one settings source rather than scattered constants.
 
--- WHAT : Window visibility flag.
--- WHY  : Closing window should not stop package work or lose state.
--- WHERE: Read by ui.render and command toggle.
--- HOW  : Passed to ImGui.Begin and returned by it.
--- WHEN  : Toggled by UI close control or `/magfarm`.
-ui.open = true -- Show window on first run.
+WHERE :
+Registered by the existing magfarm/init.lua.
+Requires magfarm.config, magfarm.state, magfarm.movement, and magfarm.readiness.
 
---[[--------------------------------------------------------------------------
-  ui.tooltip(text)
+HOW :
+Captures one snapshot per visible frame. Displays a content-sized roster table.
+Options edits configuration only. Explicit manual actions dispatch in tick().
 
-  WHAT  : Shows hover help for the most recently drawn control.
-  WHY   : Settings need future-proof explanation at their point of use.
-  WHERE : Called after controls in this file.
-  HOW   : Opens a wrapped tooltip only while the item is hovered.
-  WHEN  : Every render frame when a control is hovered.
-----------------------------------------------------------------------------]]
-function ui.tooltip(text)
-    if not text or text == '' or not ImGui.IsItemHovered() then return end -- Avoid empty/non-hover work.
-    ImGui.BeginTooltip() -- Start tooltip scope.
-    ImGui.PushTextWrapPos(ImGui.GetFontSize() * 28) -- Keep long explanations readable.
-    ImGui.TextUnformatted(text) -- Render unformatted user-facing help.
-    ImGui.PopTextWrapPos() -- Restore wrap setting.
-    ImGui.EndTooltip() -- Close tooltip scope.
+WHEN :
+render() runs in ImGui frames; tick() runs in the package loop.
+
+ROLE ORDER :
+Leader, Main Tank, Main Assist, Puller, Mark NPC, Master Looter, You.
+
+RESOURCE POLICY :
+Known HP/Mana values turn red when strictly below their respective thresholds.
+Defaults are 35%. Exactly 35% is not red with a 35% threshold.
+Absent or unknown resource values display neutral --.
+Remote mana colouring reflects group-reported data, not independent validation.
+
+LAYOUT :
+No ScrollX/ScrollY flags or fixed roster-row heights.
+Each member row grows only to fit its actual cell contents.
+
+OPTIONS :
+Persistent display settings only; writes occur in tick(), not rendering.
+Future behavior settings will use separate categories and explicit permissions.
+
+SAFETY :
+Only existing explicit Stop All Movement, Pet Back Off, and Pet Follow commands.
+Explicit optional-plugin loads require clicks; no automatic plugin changes.
+No role assignment, automatic engagement, casting, targeting, or Raid TLO reads.
+==============================================================================
+]]--
+
+local mq = require('mq')
+local ImGui = require('ImGui')
+local movement = require('magfarm.movement')
+local state = require('magfarm.state')
+local config = require('magfarm.config')
+local readiness = require('magfarm.readiness')
+
+local ui = {}
+ui.open = true
+
+--- Window/session state, separate from game observations.
+local optionsOpen = false
+local readinessSpell = 'Spear of Molten Arcronite'
+local lastAction = 'Monitor active. No automation is enabled.'
+local VERSION = '0.3.6'
+
+--- Explicit manual requests consumed by tick().
+local stopAllRequested = false
+local petBackOffRequested = false
+local petFollowRequested = false
+
+--- Bounded history of explicit manual actions and settings diagnostics.
+local LOG_MAX = 20
+local activityLog = {}
+
+--- Display-only colours.
+local COLOR_GOOD = { 0.35, 0.85, 0.40, 1.0 }
+local COLOR_WARN = { 0.95, 0.80, 0.30, 1.0 }
+local COLOR_BAD = { 1.00, 0.40, 0.35, 1.0 }
+local COLOR_INFO = { 0.70, 0.70, 0.70, 1.0 }
+
+--- Role metadata follows the operator's requested display order.
+local ROLE_ORDER = {
+    { key = 'mainTank', label = 'Main Tank' },
+    { key = 'mainAssist', label = 'Main Assist' },
+    { key = 'puller', label = 'Puller' },
+    { key = 'markNpc', label = 'Mark NPC' },
+    { key = 'masterLooter', label = 'Master Looter' },
+}
+
+--[[
+------------------------------------------------------------------------------
+FUNCTION : textColored(color, text)
+WHAT : Draws coloured text.
+WHY : Centralizes RGBA handling.
+WHERE : Status and resource rendering.
+HOW : Calls ImGui.TextColored with explicit components.
+WHEN : During visible rendering.
+------------------------------------------------------------------------------
+]]
+local function textColored(color, text)
+    ImGui.TextColored(color[1], color[2], color[3], color[4], text)
 end
 
---[[--------------------------------------------------------------------------
-  ui.drawControls()
+--[[
+------------------------------------------------------------------------------
+FUNCTION : tooltip(text)
+WHAT : Explains the preceding item on hover.
+WHY : Keeps detail out of the main layout.
+WHERE : Buttons, resources, and Options controls.
+HOW : Calls ImGui.SetItemTooltip.
+WHEN : Immediately after the relevant item.
+------------------------------------------------------------------------------
+]]
+local function tooltip(text)
+    ImGui.SetItemTooltip(text)
+end
 
-  WHAT  : Draws Start/Stop/Pause/Resume/Camp/Save buttons.
-  WHY   : Lifecycle actions should remain visible regardless of active tab.
-  WHERE : Called by ui.render above the tab bar.
-  HOW   : Buttons call state functions; no button waits or runs a job itself.
-  WHEN  : Every visible frame.
-----------------------------------------------------------------------------]]
-function ui.drawControls()
-    if runtime.running then -- Running state exposes Stop and Pause/Resume.
-        if ImGui.Button('Stop') then state.stop('UI button') end -- Request safe stop.
-        ImGui.SameLine() -- Keep controls compact.
-        if runtime.state == runtime.STATE.PAUSED then if ImGui.Button('Resume') then state.resume() end else if ImGui.Button('Pause') then state.pause('UI button') end end -- Choose correct lifecycle action.
-    else -- Idle state exposes Start.
-        if ImGui.Button('Start') then state.start() end -- Request preflight/start.
-        ImGui.SameLine() -- Keep next action adjacent.
-        ImGui.BeginDisabled() ImGui.Button('Pause') ImGui.EndDisabled() -- Show unavailable pause transparently.
+--[[
+------------------------------------------------------------------------------
+FUNCTION : percentText(value)
+WHAT : Formats known percentages or returns --.
+WHY : Unknown data must not be rendered as zero.
+WHERE : Resource, pet, and target displays.
+HOW : Formats numeric values without substituting a numeric fallback.
+WHEN : Each resource display.
+------------------------------------------------------------------------------
+]]
+local function percentText(value)
+    if type(value) ~= 'number' then
+        return '--'
     end
-    ImGui.SameLine() -- Put camp on same row.
-    if ImGui.Button('Set Camp Here') then state.setCamp() end -- Capture explicit camp anchor.
-    ui.tooltip('Save the current Y/X/Z location as the Camp mode anchor.') -- Explain camp capture.
-    ImGui.SameLine() -- Keep save accessible.
-    if ImGui.Button('Save Settings') then config.save() end -- Persist current settings.
+    return string.format('%.0f%%', value)
 end
 
---[[--------------------------------------------------------------------------
-  ui.drawStatus()
+--[[
+------------------------------------------------------------------------------
+FUNCTION : drawResource(value, key, prefix)
+WHAT : Displays a percentage with configurable low-resource colour.
+WHY : Local and roster displays must use identical threshold rules.
+WHERE : Character HP/Mana and group HP/Mana cells.
+HOW : Uses config.get(key); red only for known values strictly below threshold.
+WHEN : Each visible resource item.
+NOTE : Prefix is optional. Missing values are neutral --.
+------------------------------------------------------------------------------
+]]
+local function drawResource(value, key, prefix)
+    local text = (prefix or '') .. percentText(value)
 
-  WHAT  : Draws state, mode, character, zone, camp, and safety summary lines.
-  WHY   : Operators need an immediate answer to “what is it doing and why?”.
-  WHERE : Called by ui.render under the controls.
-  HOW   : Reads cached module/runtime facts; does not issue game commands.
-  WHEN  : Every visible frame.
-----------------------------------------------------------------------------]]
-function ui.drawStatus()
-    ImGui.Text(string.format('State: %s', runtime.state)) -- Show exact state-machine label.
-    ImGui.SameLine() ImGui.TextDisabled(string.format('Mode: %s', runtime.mode)) -- Show requested mode.
-    ImGui.Text(string.format('Character: %s (%s)  Level: %d', mq.TLO.Me.CleanName() or '?', mq.TLO.Me.Class.ShortName() or '?', mq.TLO.Me.Level() or 0)) -- Show key context.
-    ImGui.Text(string.format('Zone: %s', mq.TLO.Zone.Name() or '?')) -- Show current zone.
-    if runtime.camp then ImGui.Text(string.format('Camp: Y %.1f X %.1f Z %.1f', runtime.camp.y, runtime.camp.x, runtime.camp.z)) else ImGui.TextDisabled('Camp: not set') end -- Show explicit camp status.
-    ImGui.TextWrapped('Status: ' .. (runtime.status or '')) -- Explain current behavior/failure.
-    if assist.status.grouped and not assist.status.valid then ImGui.TextColored(1.0, 0.35, 0.25, 1.0, 'GROUP WARNING: ' .. assist.status.warning) end -- Emphasize group safety lockout.
-end
-
---[[--------------------------------------------------------------------------
-  ui.drawModeTab()
-
-  WHAT  : Draws mode and follow-leader configuration controls.
-  WHY   : Movement/camp intent must be explicit and visible.
-  WHERE : Called from ui.render tab bar.
-  HOW   : Uses radio buttons and text input bound to config.settings.
-  WHEN  : Every frame while Mode tab is active.
-----------------------------------------------------------------------------]]
-function ui.drawModeTab()
-    if not ImGui.BeginTabItem('Mode') then return end -- Skip inactive tab work.
-    ImGui.Text('Operating mode') -- Tab heading.
-    for _, mode in ipairs({ 'manual', 'camp', 'follow' }) do -- Render supported choices.
-        if ImGui.RadioButton(mode:sub(1,1):upper() .. mode:sub(2), config.settings.mode == mode) then state.setMode(mode) end -- Update selected mode.
-        ImGui.SameLine() -- Put choices on one row.
+    if type(value) ~= 'number' then
+        textColored(COLOR_INFO, text)
+    elseif value < config.get(key) then
+        textColored(COLOR_BAD, text)
+    else
+        ImGui.Text(text)
     end
-    ImGui.NewLine() -- End radio row cleanly.
-    ImGui.SetNextItemWidth(220) -- Give leader field practical width.
-    local leader, changed = ImGui.InputText('Follow leader', config.settings.followLeader or '') -- Read editable leader name.
-    if changed then config.settings.followLeader = leader end -- Store current text.
-    ui.tooltip('Clean name of a current group member. Follow movement remains preview-only until MQ2Nav command behavior is verified.') -- Explain staging.
-    ImGui.SetNextItemWidth(160) -- Size numeric field.
-    local desired, desiredChanged = ImGui.SliderInt('Desired follow distance', config.settings.followDistance, 5, 200) -- Edit future follow spacing.
-    if desiredChanged then config.settings.followDistance = desired config.validate() end -- Validate related thresholds.
-    ImGui.SetNextItemWidth(160) -- Size numeric field.
-    local repath, repathChanged = ImGui.SliderInt('Repath distance', config.settings.followRepathDistance, 5, 400) -- Edit future repath boundary.
-    if repathChanged then config.settings.followRepathDistance = repath config.validate() end -- Preserve hysteresis.
-    ImGui.Separator() -- Divide settings from live facts.
-    ImGui.Text(string.format('Follow status: %s', follow.status.reason or '')) -- Explain current leader resolution.
-    if follow.status.name ~= '' then ImGui.Text(string.format('Leader: %s  Distance: %.0f', follow.status.name, follow.status.distance or -1)) end -- Show resolved leader.
-    ImGui.EndTabItem() -- Close active tab.
 end
 
---[[--------------------------------------------------------------------------
-  ui.drawSpellsTab()
-
-  WHAT  : Shows role selections, overrides, recommendations, and acquisition scan.
-  WHY   : Spell changes should be transparent and operator-controlled.
-  WHERE : Called from ui.render tab bar.
-  HOW   : Renders CATALOG roles, per-role text overrides, and scan buttons.
-  WHEN  : Every frame while Spells tab is active.
-----------------------------------------------------------------------------]]
-function ui.drawSpellsTab()
-    if not ImGui.BeginTabItem('Spells') then return end -- Skip inactive tab work.
-    if ImGui.Button('Refresh Spells') then spells.detect() end -- Request explicit book scan.
-    ImGui.SameLine() -- Keep acquisition action nearby.
-    if ImGui.Button('Scan Vendor and Inventory') then state.requestAcquisitionScan() end -- Start safe preview workflow.
-    ui.tooltip('Pauses normal workflow and creates a scan-only Spell Acquisition preview in version 0.1.') -- Explain no-spend safety.
-    ImGui.Separator() -- Separate actions from role list.
-    for role, descriptor in pairs(spells.selected) do -- Render each current role.
-        local label = role:gsub('(%l)(%u)', '%1 %2') -- Make camelCase readable.
-        ImGui.Text(string.format('%s: %s (%s)', label, descriptor.name or 'none found', descriptor.source)) -- Show current selection/source.
-        ImGui.SameLine() -- Put override field beside selection.
-        ImGui.SetNextItemWidth(220) -- Give override field space.
-        local override, changed = ImGui.InputText('##override_' .. role, config.settings.spellOverrides[role] or '') -- Read hidden-ID override input.
-        if changed then config.settings.spellOverrides[role] = override end -- Store typed override.
-        ui.tooltip('Leave blank for best-first auto detection. A typed override must be scribed to be selected.') -- Explain override precedence.
-        local recommendation = spells.recommendations[role] -- Look for an auto-detected change.
-        if recommendation then ImGui.SameLine() ImGui.TextColored(0.95, 0.80, 0.25, 1.0, string.format('recommended: %s', recommendation.to)) end -- Surface review item.
+--[[
+------------------------------------------------------------------------------
+FUNCTION : logEvent(message)
+WHAT : Records one timestamped readiness, settings, or explicit manual-action event.
+WHY : Provides a bounded audit trail.
+WHERE : Manual request functions and the readiness/settings drains in tick().
+HOW : Appends using mq.gettime() and trims oldest entries.
+WHEN : A manual request, readiness transition, or settings diagnostic is recorded.
+------------------------------------------------------------------------------
+]]
+local function logEvent(message)
+    table.insert(activityLog, string.format('[%d] %s', mq.gettime(), message))
+    while #activityLog > LOG_MAX do
+        table.remove(activityLog, 1)
     end
-    ImGui.Separator() -- Separate roles from acquisition preview.
-    ImGui.Text('Spell Acquisition preview') -- Attribution-related feature section heading.
-    ImGui.TextWrapped(acquisition.plan.message or '') -- Explain most recent scan result.
-    ImGui.Text(string.format('Merchant open: %s | Range: %d-%d | Spending cap: %d pp', acquisition.plan.merchantOpen and 'yes' or 'no', acquisition.plan.minLevel or 0, acquisition.plan.maxLevel or 0, acquisition.plan.spendCap or 0)) -- Show plan context.
-    for _, item in ipairs(acquisition.plan.skipped or {}) do ImGui.TextDisabled('• ' .. item) end -- Show intentional/explained skips.
-    ImGui.TextDisabled('Credits: scribe.mac by Sym; source updates credited to Chatwiththisname, Lemons, and Sic. See ATTRIBUTION.md.') -- Preserve visible provenance.
-    ImGui.EndTabItem() -- Close active tab.
 end
 
---[[--------------------------------------------------------------------------
-  ui.drawPolicyTab()
-
-  WHAT  : Displays live group, pet, and mercenary policy status.
-  WHY   : The operator must see why offense/taunt/merc behavior is constrained.
-  WHERE : Called from ui.render tab bar.
-  HOW   : Renders cached descriptors with no command side effects.
-  WHEN  : Every frame while Policy tab is active.
-----------------------------------------------------------------------------]]
-function ui.drawPolicyTab()
-    if not ImGui.BeginTabItem('Policy') then return end -- Skip inactive tab work.
-    ImGui.Text('Group / Main Assist') -- Group section heading.
-    ImGui.Text(string.format('Grouped: %s', assist.status.grouped and 'yes' or 'no')) -- Show group condition.
-    ImGui.Text(string.format('Main Assist valid: %s', assist.status.valid and 'yes' or 'no')) -- Show safe MA status.
-    if assist.status.warning ~= '' then ImGui.TextWrapped('Warning: ' .. assist.status.warning) end -- Explain lockout.
-    ImGui.Separator() -- Divide pet status.
-    ImGui.Text('Pet') -- Pet heading.
-    ImGui.Text(string.format('Pet: %s  HP: %d%%', pet.status.name ~= '' and pet.status.name or 'none', pet.status.hp or 0)) -- Show pet facts.
-    local tauntText = pet.status.desiredTaunt == nil and 'unchanged' or (pet.status.desiredTaunt and 'ON' or 'OFF') -- Format nullable policy.
-    ImGui.Text(string.format('Desired taunt: %s — %s', tauntText, pet.status.reason or '')) -- Explain desired policy.
-    ImGui.Separator() -- Divide mercenary status.
-    ImGui.Text('Mercenary') -- Merc heading.
-    ImGui.Text(string.format('Merc: %s  Class: %s  HP: %d%%', merc.status.name ~= '' and merc.status.name or 'none', merc.status.class or '', merc.status.hp or 0)) -- Show merc facts.
-    ImGui.TextWrapped('Policy: ' .. (merc.status.policy or '')) -- Explain staged merc behavior.
-    ImGui.TextDisabled('Pet and mercenary commands are intentionally not issued in 0.1 until verified on this client/server.') -- Keep scope clear.
-    ImGui.EndTabItem() -- Close active tab.
+--[[
+------------------------------------------------------------------------------
+FUNCTION : ui.requestStopAllMovement()
+WHAT : Queues manual movement cancellation.
+WHY : Separates request handling from commands.
+WHERE : Safety button and existing slash binding.
+HOW : Sets a flag and logs the request.
+WHEN : Explicit operator initiation only.
+------------------------------------------------------------------------------
+]]
+function ui.requestStopAllMovement()
+    stopAllRequested = true
+    lastAction = 'Stop All Movement queued.'
+    logEvent('Stop All Movement queued by operator.')
 end
 
---[[--------------------------------------------------------------------------
-  ui.drawSettingsTab()
-
-  WHAT  : Draws core safety/settings controls needed in the foundation.
-  WHY   : Makes defaults reviewable before later behavior is enabled.
-  WHERE : Called from ui.render tab bar.
-  HOW   : Uses checkboxes/sliders directly bound to config.settings and validates
-          relationships after numeric changes.
-  WHEN  : Every frame while Settings tab is active.
-----------------------------------------------------------------------------]]
-function ui.drawSettingsTab()
-    if not ImGui.BeginTabItem('Settings') then return end -- Skip inactive tab work.
-    local debug, changedDebug = ImGui.Checkbox('Debug trace', config.settings.debug == true) -- Edit debug setting.
-    if changedDebug then config.settings.debug = debug end -- Persist in-memory value.
-    local groupAssist, changedGroup = ImGui.Checkbox('Use group Main Assist policy', config.settings.useGroupAssist == true) -- Edit ownership policy.
-    if changedGroup then config.settings.useGroupAssist = groupAssist end -- Store change.
-    local requireMA, changedMA = ImGui.Checkbox('Require valid Main Assist when grouped', config.settings.requireMainAssist == true) -- Edit safety lockout.
-    if changedMA then config.settings.requireMainAssist = requireMA end -- Store change.
-    local petTaunt, changedPet = ImGui.Checkbox('Manage pet taunt policy', config.settings.managePetTaunt == true) -- Edit future pet control policy.
-    if changedPet then config.settings.managePetTaunt = petTaunt end -- Store change.
-    local mercManage, changedMerc = ImGui.Checkbox('Manage mercenary policy', config.settings.manageMercenary == true) -- Edit future merc policy.
-    if changedMerc then config.settings.manageMercenary = mercManage end -- Store change.
-    ImGui.SetNextItemWidth(160) -- Size assist gate slider.
-    local assistPct, changedAssist = ImGui.SliderInt('Assist at target HP %', config.settings.assistAtPct, 1, 100) -- Edit future assist gate.
-    if changedAssist then config.settings.assistAtPct = assistPct config.validate() end -- Store and validate.
-    ImGui.SetNextItemWidth(160) -- Size self-defense slider.
-    local defensePct, changedDefense = ImGui.SliderInt('Self-defense at my HP %', config.settings.selfDefenseAtPct, 1, 99) -- Edit future emergency gate.
-    if changedDefense then config.settings.selfDefenseAtPct = defensePct config.validate() end -- Store and validate paired recovery.
-    ImGui.SetNextItemWidth(160) -- Size release slider.
-    local releasePct, changedRelease = ImGui.SliderInt('Self-defense recovery HP %', config.settings.selfDefenseReleasePct, 1, 100) -- Edit future release threshold.
-    if changedRelease then config.settings.selfDefenseReleasePct = releasePct config.validate() end -- Preserve hysteresis.
-    ImGui.Separator() -- Divide acquisition settings.
-    ImGui.Text('Spell Acquisition') -- Acquisition heading.
-    ImGui.SetNextItemWidth(160) -- Size spending cap field.
-    local spend, changedSpend = ImGui.InputInt('Maximum platinum', config.settings.acquisitionMaxSpendPlat, 1, 100) -- Edit future hard cap.
-    if changedSpend then config.settings.acquisitionMaxSpendPlat = spend config.validate() end -- Store safe cap.
-    ImGui.TextDisabled('Execution remains disabled in 0.1 regardless of settings.') -- Reinforce version scope.
-    ImGui.EndTabItem() -- Close active tab.
+--[[
+------------------------------------------------------------------------------
+FUNCTION : ui.requestPetBackOff()
+WHAT : Queues manual pet back-off.
+WHY : Provides operator-controlled recovery.
+WHERE : Pet button.
+HOW : Sets a flag and logs the request.
+WHEN : Explicit operator initiation only.
+------------------------------------------------------------------------------
+]]
+function ui.requestPetBackOff()
+    petBackOffRequested = true
+    lastAction = 'Pet Back Off queued.'
+    logEvent('Pet Back Off queued by operator.')
 end
 
---[[--------------------------------------------------------------------------
-  ui.drawLogTab()
+--[[
+------------------------------------------------------------------------------
+FUNCTION : ui.requestPetFollow()
+WHAT : Queues manual pet follow.
+WHY : Provides recovery without automated movement decisions.
+WHERE : Pet button.
+HOW : Sets a flag and logs the request.
+WHEN : Explicit operator initiation only.
+------------------------------------------------------------------------------
+]]
+function ui.requestPetFollow()
+    petFollowRequested = true
+    lastAction = 'Pet Follow queued.'
+    logEvent('Pet Follow queued by operator.')
+end
 
-  WHAT  : Renders the bounded runtime activity log.
-  WHY   : Lets future-you see decisions that happened while away from keyboard.
-  WHERE : Called from ui.render tab bar.
-  HOW   : Prints cached runtime lines in a scrollable child region.
-  WHEN  : Every frame while Log tab is active.
-----------------------------------------------------------------------------]]
-function ui.drawLogTab()
-    if not ImGui.BeginTabItem('Log') then return end -- Skip inactive tab work.
-    if ImGui.BeginChild('magfarm_log', 0, 260, true) then -- Create scrollable log pane.
-        for _, line in ipairs(runtime.log) do ImGui.TextWrapped(line) end -- Render chronological history.
-        ImGui.EndChild() -- Close child pane.
+--[[
+------------------------------------------------------------------------------
+FUNCTION : ui.tick()
+WHAT : Processes readiness requests, records diagnostics, saves settings, and dispatches manual actions.
+WHY : Keeps command side effects outside rendering.
+WHERE : Existing main loop.
+HOW : Ticks readiness, drains readiness events once, flushes/drains settings,
+      then dispatches queued movement/pet requests outside rendering.
+WHEN : Each package-loop pass.
+SAFETY : No observed state can initiate an action.
+------------------------------------------------------------------------------
+]]
+function ui.tick()
+    readiness.tick()
+    for _, event in ipairs(readiness.drainEvents()) do
+        logEvent(event)
     end
-    if ImGui.Button('Clear Log') then runtime.log = {} end -- Allow operator cleanup.
-    ImGui.SameLine() ImGui.TextDisabled(string.format('%d / %d lines', #runtime.log, runtime.LOG_MAX)) -- Show bounded capacity.
-    ImGui.EndTabItem() -- Close active tab.
+    config.flush()
+    -- WHAT: Consume settings results once; WHY: make saves visible in the log.
+    -- WHERE: Main-loop tick; HOW: drain the bounded queue; WHEN: after flush.
+    for _, event in ipairs(config.drainEvents()) do
+        logEvent(event)
+    end
+    if stopAllRequested then
+        stopAllRequested = false
+        lastAction = movement.stopAll()
+        logEvent(lastAction)
+    end
+    if petBackOffRequested then
+        petBackOffRequested = false
+        movement.petBackOff()
+        lastAction = 'Pet Back Off sent: /pet back off.'
+        logEvent('Pet Back Off command sent.')
+    end
+    if petFollowRequested then
+        petFollowRequested = false
+        movement.petFollow()
+        lastAction = 'Pet Follow sent: /pet follow.'
+        logEvent('Pet Follow command sent.')
+    end
 end
 
---[[--------------------------------------------------------------------------
-  ui.render()
+--[[
+------------------------------------------------------------------------------
+FUNCTION : drawOptions()
+WHAT : Draws persistent resource settings in a separate window.
+WHY : Establishes an Options UI without crowding the monitor.
+WHERE : Called by render() independently of the main window.
+HOW : Edits validated numeric settings; balances Begin/End.
+WHEN : The operator has opened Options.
+SAFETY : Edits display settings only; no game actions.
+------------------------------------------------------------------------------
+]]
+local function drawOptions()
+    if not optionsOpen then
+        return
+    end
 
-  WHAT  : Draws one complete MagFarm UI frame.
-  WHY   : MacroQuest ImGui requires a single callback that returns quickly.
-  WHERE : Registered by init.lua.
-  HOW   : Opens window, draws controls/status/tabs, and always closes ImGui.Begin.
-  WHEN  : Every frame while ui.open is true.
-----------------------------------------------------------------------------]]
-function ui.render()
-    if not ui.open then return end -- Hidden window does not draw but package continues.
-    ImGui.SetNextWindowSize(640, 620, ImGuiCond.FirstUseEver) -- Provide useful first-run dimensions.
-    local draw -- Capture Begin's body-draw flag.
-    draw, ui.open = ImGui.Begin('MagFarm##magfarm', ui.open) -- Begin stable-ID window.
-    if draw then -- Draw contents only when not collapsed/clipped.
-        ui.drawControls() -- Always-visible lifecycle controls.
-        ImGui.Separator() -- Visual boundary.
-        ui.drawStatus() -- Always-visible runtime explanation.
-        ImGui.Separator() -- Visual boundary.
-        if ImGui.BeginTabBar('magfarm_tabs') then -- Organize larger controls.
-            ui.drawModeTab() -- Mode/follow settings.
-            ui.drawSpellsTab() -- Spell roles/acquisition preview.
-            ui.drawPolicyTab() -- Group/pet/merc policy facts.
-            ui.drawSettingsTab() -- Foundation settings.
-            ui.drawLogTab() -- History.
-            ImGui.EndTabBar() -- Close tab bar.
+    ImGui.SetNextWindowSize(420, 250, ImGuiCond.FirstUseEver)
+    local show
+    optionsOpen, show = ImGui.Begin('MagFarm Options##magfarm_options', optionsOpen)
+
+    if show then
+        ImGui.Text('Resource colours')
+        ImGui.TextWrapped(
+            'A known value turns red only when below its threshold. ' ..
+            'Exactly equal is not red. Valid range: 0 to 100.'
+        )
+
+        ImGui.SetNextItemWidth(100)
+        local hp = ImGui.InputInt('HP red below (%)', config.get('hpRedBelow'))
+        if hp ~= config.get('hpRedBelow') then
+            config.set('hpRedBelow', hp)
+        end
+
+        ImGui.SetNextItemWidth(100)
+        local mana = ImGui.InputInt('Mana red below (%)', config.get('manaRedBelow'))
+        if mana ~= config.get('manaRedBelow') then
+            config.set('manaRedBelow', mana)
+        end
+
+        if ImGui.Button('Reset display defaults') then
+            config.reset()
+        end
+
+        ImGui.Separator()
+        -- WHAT: Show persistence status; WHY: expose failures; WHERE: Options.
+        -- HOW: config.status(); WHEN: each visible Options frame.
+        ImGui.TextWrapped(config.status())
+        ImGui.TextWrapped(
+            'Settings are saved per server and character. ' ..
+            'Remote mana is group-reported and may be inaccurate. ' ..
+            'These colours never trigger actions.'
+        )
+    end
+
+    ImGui.End()
+end
+
+--[[
+------------------------------------------------------------------------------
+FUNCTION : roleLabels(member)
+WHAT : Produces ordered active role labels and explicit unknown markers.
+WHY : Supports overlapping roles without treating unknown reads as unassigned.
+WHERE : Roles table cell.
+HOW : Leader first, ordered role flags, then You; unknown readings get ? labels.
+WHEN : Each visible member row.
+------------------------------------------------------------------------------
+]]
+local function roleLabels(member)
+    local labels = {}
+
+    if member.isLeader == true then
+        table.insert(labels, 'Leader')
+    elseif member.isLeader == nil then
+        table.insert(labels, 'Leader ?')
+    end
+
+    for _, definition in ipairs(ROLE_ORDER) do
+        if not member.rolesKnown or
+            member.rolesKnown[definition.key] ~= true then
+            table.insert(labels, definition.label .. ' ?')
+        elseif member.roles[definition.key] == true then
+            table.insert(labels, definition.label)
         end
     end
-    ImGui.End() -- Always match Begin, even when body was not drawn.
+
+    if member.isSelf then
+        table.insert(labels, 'You')
+    end
+
+    if #labels == 0 then
+        table.insert(labels, '--')
+    end
+
+    return labels
 end
 
-return ui -- Export ImGui callback module.
+--[[
+------------------------------------------------------------------------------
+FUNCTION : rosterStatus(member)
+WHAT : Selects reported member status and colour.
+WHY : Keeps presence independent of resource warnings.
+WHERE : Member Status cell.
+HOW : Prioritizes death, explicit absence, unknown presence, then presence.
+WHEN : Each member row.
+------------------------------------------------------------------------------
+]]
+local function rosterStatus(member)
+    if member.dead == true then
+        return 'DEAD', COLOR_BAD
+    end
+    if member.present == false then
+        return 'Not Present', COLOR_WARN
+    end
+    if member.present == nil then
+        return 'Unknown', COLOR_WARN
+    end
+    if member.dead == nil then
+        return 'Present; death ?', COLOR_WARN
+    end
+    return 'Present', COLOR_GOOD
+end
 
---[[==========================================================================
-  END OF FILE : magfarm/ui.lua
+--[[
+------------------------------------------------------------------------------
+FUNCTION : drawSummary(snapshot)
+WHAT : Displays roster totals and exclusive availability counts.
+WHY : Gives awareness with the detailed table collapsed.
+WHERE : Below header.
+HOW : Counts dead first, then known presence, otherwise unavailable; unknown
+      presence is included in unavailable for this observational summary.
+WHEN : Each visible frame.
+------------------------------------------------------------------------------
+]]
+local function drawSummary(snapshot)
+    local total, present, unavailable, dead = 0, 0, 0, 0
 
-  EXPORTS
-    open            Window visibility.
-    tooltip(text)   Hover help helper.
-    render()        MacroQuest ImGui frame callback.
+    for _, member in ipairs(snapshot.roster.members) do
+        total = total + 1
+        if member.dead == true then
+            dead = dead + 1
+        elseif member.present == true then
+            present = present + 1
+        else
+            unavailable = unavailable + 1
+        end
+    end
 
-  DEPENDENCIES : mq, ImGui, and MagFarm state/config/runtime/status modules.
+    local color = COLOR_INFO
+    if dead > 0 then
+        color = COLOR_BAD
+    elseif unavailable > 0 then
+        color = COLOR_WARN
+    elseif total > 0 then
+        color = COLOR_GOOD
+    end
 
-  HOW TO EDIT SAFELY
-    - Never call mq.delay or execute a multi-step game job from this file.
-    - Request actions through state.lua and display results from runtime/module caches.
-    - Always match ImGui.Begin with ImGui.End.
-==========================================================================]]--
+    local leader = snapshot.roster.leaderName
+    if leader == '' then leader = 'Unknown' end
+
+    ImGui.PushStyleColor(ImGuiCol.Text, color[1], color[2], color[3], color[4])
+    ImGui.TextWrapped(string.format(
+        'Group: %d members | %d present | %d unavailable | %d dead | Leader: %s',
+        total, present, unavailable, dead, leader
+    ))
+    ImGui.PopStyleColor()
+end
+
+--[[
+------------------------------------------------------------------------------
+FUNCTION : drawMember(member)
+WHAT : Draws seven aligned member cells with stacked roles.
+WHY : Preserves compact content-driven rows and independent resource colouring.
+WHERE : Inside drawRoster() table.
+HOW : Starts a row without explicit height; renders each cell once except roles.
+WHEN : Each displayed member.
+SAFETY : Read-only; remote red mana reflects reported data only.
+------------------------------------------------------------------------------
+]]
+local function drawMember(member)
+    local available = member.present == true
+    local hp, mana, distance = nil, nil, '--'
+    local class = '--'
+
+    if available then
+        hp = member.hpPct
+        mana = member.manaPct
+        class = member.classShortName or '--'
+        if type(member.distance) == 'number' then
+            distance = string.format('%.1f', member.distance)
+        end
+    end
+
+    ImGui.TableNextRow()
+
+    ImGui.TableSetColumnIndex(0)
+    ImGui.Text(member.name)
+
+    ImGui.TableSetColumnIndex(1)
+    for _, label in ipairs(roleLabels(member)) do
+        ImGui.Text(label)
+    end
+
+    ImGui.TableSetColumnIndex(2)
+    ImGui.Text(class)
+
+    ImGui.TableSetColumnIndex(3)
+    drawResource(hp, 'hpRedBelow')
+
+    ImGui.TableSetColumnIndex(4)
+    drawResource(mana, 'manaRedBelow')
+    if not member.isSelf then
+        tooltip(
+            'Group-reported mana. Earlier tests found an inaccurate zero ' ..
+            'reading. Red means the reported value is below the configured ' ..
+            'threshold, not independent confirmation of low mana.'
+        )
+    end
+
+    ImGui.TableSetColumnIndex(5)
+    ImGui.Text(distance)
+
+    ImGui.TableSetColumnIndex(6)
+    local text, color = rosterStatus(member)
+    textColored(color, text)
+end
+
+--[[
+------------------------------------------------------------------------------
+FUNCTION : drawRoster(snapshot)
+WHAT : Draws the content-sized role-aware local-group table.
+WHY : Keeps fields aligned and expands rows only for actual role content.
+WHERE : Between Character and Pet panels.
+HOW : Stable IDs, resizable columns, no scrolling table flags or fixed heights.
+WHEN : Roster section is expanded.
+NOTE : Roles may remain readable while resource telemetry is unavailable.
+------------------------------------------------------------------------------
+]]
+local function drawRoster(snapshot)
+    local roster = snapshot.roster
+    local leader = roster.leaderName ~= '' and roster.leaderName or 'Unknown'
+    local header = string.format(
+        'Group Roster (%d) - Leader: %s###magfarm_group_roster',
+        #roster.members, leader
+    )
+
+    if not ImGui.CollapsingHeader(header) then return end
+    if #roster.members == 0 then
+        ImGui.TextWrapped('No occupied local group slots were detected.')
+        return
+    end
+
+    ImGui.TextWrapped('Roles stack independently. A ? means that role read is unknown.')
+
+    local flags =
+        ImGuiTableFlags.BordersInnerV +
+        ImGuiTableFlags.RowBg +
+        ImGuiTableFlags.Resizable +
+        ImGuiTableFlags.SizingFixedFit
+
+    if ImGui.BeginTable('magfarm_group_roster_table', 7, flags) then
+        ImGui.TableSetupColumn('Name', ImGuiTableColumnFlags.WidthFixed, 85)
+        ImGui.TableSetupColumn('Roles', ImGuiTableColumnFlags.WidthFixed, 105)
+        ImGui.TableSetupColumn('Class', ImGuiTableColumnFlags.WidthFixed, 40)
+        ImGui.TableSetupColumn('HP', ImGuiTableColumnFlags.WidthFixed, 42)
+        ImGui.TableSetupColumn('Mana', ImGuiTableColumnFlags.WidthFixed, 42)
+        ImGui.TableSetupColumn('Distance', ImGuiTableColumnFlags.WidthFixed, 65)
+        ImGui.TableSetupColumn('Status', ImGuiTableColumnFlags.WidthFixed, 90)
+        ImGui.TableHeadersRow()
+
+        for _, member in ipairs(roster.members) do
+            drawMember(member)
+        end
+
+        ImGui.EndTable()
+    end
+end
+
+--[[
+------------------------------------------------------------------------------
+FUNCTION : drawHeader(snapshot)
+WHAT : Displays identity, Options access, and manual movement stop.
+WHY : Keeps key controls visible.
+WHERE : First monitor panel.
+HOW : Options toggles local window state; stop queues an explicit request.
+WHEN : Each visible frame.
+------------------------------------------------------------------------------
+]]
+local function drawHeader(snapshot)
+    ImGui.Text('MagFarm v' .. VERSION .. ' - Read-Only Monitor')
+    ImGui.SameLine()
+    if ImGui.Button('Options') then
+        optionsOpen = not optionsOpen
+    end
+    tooltip('Display settings only. Does not enable combat or change group roles.')
+
+    textColored(COLOR_INFO, string.format(
+        '%s - Level %d %s - %s',
+        snapshot.character.name, snapshot.character.level,
+        snapshot.character.class, snapshot.character.zone
+    ))
+
+    ImGui.BeginDisabled(readiness.stopCount() == 0)
+    if ImGui.Button('Stop All Movement', 180, 0) then
+        ui.requestStopAllMovement()
+    end
+    ImGui.EndDisabled()
+    tooltip('Best-effort stop for loaded EasyFind/Nav/MoveUtils components only. Does not stop native follow or other automation. Never starts movement.')
+    ImGui.SameLine()
+    textColored(COLOR_WARN, lastAction)
+    ImGui.Separator()
+end
+
+--[[
+FUNCTION: drawReadiness()
+WHAT: Show startup dependencies, current stop coverage and manual load controls
+WHY: Missing optional plugins must be visible without blocking the monitor
+WHERE: Main monitor between the summary and Character panels
+HOW: Render cached rows; queue refresh/load requests; never query or load in render
+WHEN: Each visible frame; details expand only when the operator opens the panel
+SAFETY: Plugin presence is not proof of an active conflict or command outcome
+]]
+local function drawReadiness()
+    local count = readiness.stopCount()
+    textColored(count == 3 and COLOR_GOOD or COLOR_WARN,
+        string.format('Readiness: %d/3 movement-stop components available', count))
+    if not ImGui.CollapsingHeader('Startup Readiness##magfarm_readiness') then return end
+    ImGui.Text('ImGui Lua bindings: ' .. (readiness.bindingsReady() and 'Available' or 'Unavailable'))
+    if ImGui.Button('Refresh readiness') then readiness.requestRefresh() end
+    tooltip('Queues a read-only plugin check in the main loop.')
+    for _, row in ipairs(readiness.getRows()) do
+        ImGui.TextWrapped(row.name .. ': ' .. row.label .. ' - ' .. row.purpose)
+        if row.detail ~= '' then textColored(COLOR_WARN, row.detail) end
+        if row.loadable then
+            ImGui.BeginDisabled(row.loaded)
+            if ImGui.Button('Load ' .. row.name .. '##magfarm_load_' .. row.name) then
+                readiness.requestLoad(row.name)
+            end
+            ImGui.EndDisabled()
+            tooltip('/plugin ' .. row.name .. ' load noauto. Explicit session-only load; the plugin may execute its own initialization.')
+        end
+    end
+    ImGui.TextWrapped('Plugins are never loaded or unloaded automatically. Unknown reads do not enable their commands. Missing optional movement plugins do not disable pet controls.')
+    ImGui.TextWrapped('Conflict status is not established by presence alone. MQ2Melee or other automation may control movement; MagFarm does not disable it or claim exclusive control.')
+end
+
+--[[
+------------------------------------------------------------------------------
+FUNCTION : drawCharacter(snapshot)
+WHAT : Displays local resources, casting, and readiness.
+WHY : Applies shared thresholds without introducing actions.
+WHERE : Character panel.
+HOW : Renders snapshot data and session-local readiness input.
+WHEN : Each visible frame.
+------------------------------------------------------------------------------
+]]
+local function drawCharacter(snapshot)
+    ImGui.Text('Character')
+    drawResource(snapshot.character.hp, 'hpRedBelow', 'HP: ')
+    ImGui.SameLine()
+    drawResource(snapshot.character.mana, 'manaRedBelow', 'Mana: ')
+
+    if snapshot.casting.active then
+        textColored(COLOR_WARN, string.format(
+            'Casting: %s (ID %d)', snapshot.casting.name, snapshot.casting.id
+        ))
+    else
+        textColored(COLOR_GOOD, 'Casting: None')
+    end
+
+    ImGui.SetNextItemWidth(280)
+    local updated = ImGui.InputText('Readiness spell', readinessSpell)
+    if updated ~= readinessSpell then
+        readinessSpell = updated
+        logEvent('Readiness spell changed to: ' .. readinessSpell)
+    end
+    tooltip('Read-only readiness query. Does not memorize or cast.')
+
+    if snapshot.readiness.enabled then
+        textColored(
+            snapshot.readiness.ready and COLOR_GOOD or COLOR_WARN,
+            snapshot.readiness.spell .. ' readiness: ' ..
+            (snapshot.readiness.ready and 'READY' or 'NOT READY')
+        )
+    else
+        textColored(COLOR_INFO, 'Spell readiness probe disabled.')
+    end
+end
+
+--[[
+------------------------------------------------------------------------------
+FUNCTION : drawPet(snapshot)
+WHAT : Displays pet telemetry and manual recovery controls.
+WHY : Preserves operator-controlled pet safety.
+WHERE : Pet panel.
+HOW : Uses snapshot data and disables buttons when no pet exists.
+WHEN : Each visible frame.
+SAFETY : Never selects a target or sends pet attack.
+------------------------------------------------------------------------------
+]]
+local function drawPet(snapshot)
+    ImGui.Text('Pet')
+
+    if snapshot.pet.exists then
+        ImGui.Text(string.format(
+            'Name: %s (ID %d)', snapshot.pet.name, snapshot.pet.id
+        ))
+        drawResource(snapshot.pet.hp, 'hpRedBelow', 'HP: ')
+        ImGui.SameLine()
+        ImGui.Text(string.format('Distance: %.2f', snapshot.pet.distance))
+        textColored(
+            snapshot.pet.targetId == 0 and COLOR_GOOD or COLOR_WARN,
+            'State: ' .. snapshot.pet.state
+        )
+    else
+        textColored(COLOR_BAD, 'Pet: None summoned')
+    end
+
+    ImGui.BeginDisabled(not snapshot.pet.exists)
+    if ImGui.Button('Pet Back Off', 120, 0) then
+        ui.requestPetBackOff()
+    end
+    tooltip('Manual pet back-off. No targeting or pet attack.')
+    ImGui.SameLine()
+    if ImGui.Button('Pet Follow', 120, 0) then
+        ui.requestPetFollow()
+    end
+    tooltip('Manual pet follow. No travel initiation.')
+    ImGui.EndDisabled()
+end
+
+--[[
+------------------------------------------------------------------------------
+FUNCTION : drawTarget(snapshot)
+WHAT : Displays target telemetry and informational safety classification.
+WHY : Selected targets must not imply action permission.
+WHERE : Current Target panel.
+HOW : Uses existing snapshot classifications and fields.
+WHEN : Each visible frame.
+SAFETY : No target changes, assists, attacks, or casts.
+------------------------------------------------------------------------------
+]]
+local function drawTarget(snapshot)
+    local target = snapshot.target
+    ImGui.Text('Current Target')
+
+    local color = COLOR_WARN
+    if target.safetyKind == 'NPC' then color = COLOR_GOOD end
+    if target.safetyKind == 'PC' then color = COLOR_BAD end
+    if target.safetyKind == 'NONE' then color = COLOR_INFO end
+    textColored(color, target.safetyText)
+
+    if not target.exists then return end
+
+    ImGui.Text(string.format('Name: %s (ID %d)', target.name, target.id))
+    ImGui.Text(string.format(
+        'Level: %d  HP: %s  Distance: %.2f',
+        target.level, percentText(target.hp), target.distance
+    ))
+    ImGui.Text('Type: ' .. target.type)
+    ImGui.Text('Aggro holder: ' .. target.aggroHolder)
+end
+
+--[[
+------------------------------------------------------------------------------
+FUNCTION : drawGems(snapshot)
+WHAT : Displays all twelve supported spell slots.
+WHY : Empty slots must remain visible.
+WHERE : Spell Gems collapsible panel.
+HOW : Iterates captured gem records.
+WHEN : Expanded during visible rendering.
+------------------------------------------------------------------------------
+]]
+local function drawGems(snapshot)
+    if not ImGui.CollapsingHeader('Spell Gems (1-12)') then return end
+    for slot = 1, 12 do
+        local gem = snapshot.gems[slot]
+        local text = string.format('Gem %d: %s', gem.slot, gem.name)
+        if gem.empty then
+            textColored(COLOR_INFO, text)
+        else
+            ImGui.Text(text)
+        end
+    end
+end
+
+--[[
+------------------------------------------------------------------------------
+FUNCTION : drawLog()
+WHAT : Displays bounded readiness, manual-action, and settings history.
+WHY : Keeps package-originated actions auditable.
+WHERE : Activity Log panel.
+HOW : Uses a child region and always balances BeginChild/EndChild.
+WHEN : Expanded during visible rendering.
+------------------------------------------------------------------------------
+]]
+local function drawLog()
+    if not ImGui.CollapsingHeader('MagFarm Activity Log') then return end
+    if #activityLog == 0 then
+        ImGui.TextWrapped('No MagFarm activity has been recorded this session.')
+        return
+    end
+
+    local visible = ImGui.BeginChild('magfarm_activity_log', 0, 120, true)
+    if visible then
+        for _, line in ipairs(activityLog) do
+            ImGui.TextWrapped(line)
+        end
+    end
+    ImGui.EndChild()
+end
+
+--[[
+------------------------------------------------------------------------------
+FUNCTION : ui.render()
+WHAT : Draws the monitor and optional settings window.
+WHY : Provides the existing loader's callback entry point.
+WHERE : Registered by init.lua.
+HOW : Captures once, renders panels, balances Begin/End, then draws Options.
+WHEN : Each ImGui frame; Options may remain open if the monitor is hidden.
+SAFETY : Only explicit manual button requests can lead to game commands.
+------------------------------------------------------------------------------
+]]
+function ui.render()
+    if ui.open then
+        ImGui.SetNextWindowSize(650, 800, ImGuiCond.FirstUseEver)
+        local show
+        ui.open, show = ImGui.Begin('MagFarm##magfarm', ui.open)
+
+        if show then
+            local snapshot = state.capture(readinessSpell)
+            drawHeader(snapshot)
+            drawSummary(snapshot)
+            drawReadiness()
+            ImGui.Separator()
+            drawCharacter(snapshot)
+            ImGui.Separator()
+            drawRoster(snapshot)
+            ImGui.Separator()
+            drawPet(snapshot)
+            ImGui.Separator()
+            drawTarget(snapshot)
+            ImGui.Separator()
+            drawGems(snapshot)
+            ImGui.Separator()
+            drawLog()
+            ImGui.Separator()
+            ImGui.TextWrapped(
+                'v' .. VERSION .. ': Local-group monitoring and manual safety ' ..
+                'controls only. No raid collection, automatic casting, combat, ' ..
+                'pet attack, travel, targeting, or role assignment.'
+            )
+        end
+
+        ImGui.End()
+    end
+
+    drawOptions()
+end
+
+return ui
+
+--[[
+==============================================================================
+FOOTER : ui.lua
+VERSION : 0.3.6
+
+EXPORTS :
+  open
+  requestStopAllMovement()
+  requestPetBackOff()
+  requestPetFollow()
+  tick()
+  render()
+
+ROLE ORDER :
+  Leader
+  Main Tank
+  Main Assist
+  Puller
+  Mark NPC
+  Master Looter
+  You
+
+LAYOUT :
+  Content-sized rows; no fixed roster heights or table scrolling flags.
+  Role cells stack labels independently.
+  Unknown role readings display a question-mark label.
+
+RESOURCE COLOURS :
+  Character HP/Mana, roster HP/Mana, and pet HP use shared settings.
+  Known values below the threshold are red.
+  Unknown/unavailable values are neutral --.
+  Target HP remains informational and does not use ally resource colouring.
+
+OPTIONS :
+  Button-accessible separate window.
+  HP and Mana thresholds default to 35%.
+  Values are persistent, validated, and clamped to 0..100.
+  Persistence implemented; save time, values, counter and pending status shown.
+  Activity Log receives edit, reset, load, save and failure events once per tick.
+  Save counters and activity history reset when the Lua package restarts.
+  Explicit optional-plugin load controls added under Startup Readiness.
+  No automatic gameplay behavior added.
+
+SAFETY :
+  Existing explicit manual controls only.
+  No role changes, automatic resource responses, or Raid TLO reads.
+
+END OF FILE
+==============================================================================
+]]--

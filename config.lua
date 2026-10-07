@@ -1,190 +1,290 @@
---[[==========================================================================
-  FILE        : magfarm/config.lua
-  PACKAGE     : MagFarm Lua  (MacroQuest / EverQuest)
-  VERSION     : 0.1.0
-  CHANGES     : 0.1.0  Initial documented foundation.
+--[[
+FILE: config.lua
+PACKAGE: MagFarm
+VERSION: 0.3.5 diagnostics extension
+WHAT: Validated display thresholds with server/character persistence.
+WHY: Preserve edits and explicit default resets across Lua restarts.
+WHERE: Required by UI and initialized by the v0.3.5 entry point.
+HOW: Parse schema-1 text; queue writes for tick; use temporary and backup files.
+WHEN: Load at startup; save from tick and clean shutdown, never rendering.
+SAFETY: Identity reads and settings-file writes only; no gameplay commands.
+]]
+local mq = require('mq')
+local config = {}
+local definitions = {
+    hpRedBelow = {default=35, minimum=0, maximum=100},
+    manaRedBelow = {default=35, minimum=0, maximum=100},
+}
+local values = {hpRedBelow=35, manaRedBelow=35}
+local path, dirty, blocked = nil, false, false
+local statusText = 'Not initialized'
+local saveCount, loading = 0, false
+local events = {}
 
-  WHAT  : Defines, loads, validates, and saves all persistent MagFarm settings.
-  WHY   : A Magician alt, server, and play style need independent remembered
-          settings without hardcoding behavior into policy modules.
-  WHERE : Required by init, state, UI, and all decision modules.
-  HOW   : Merges a character/server Lua settings file with DEFAULTS and repairs
-          ranges/relationships before exposing config.settings.
-  WHEN  : Loaded at startup, saved on demand and clean shutdown.
-==========================================================================]]--
-
-local mq = require('mq') -- MacroQuest config directory and character TLOs.
-local utils = require('magfarm.utils') -- Conversion, copying, logging helpers.
-local config = {} -- Module export table.
-
--- WHAT : Complete persisted settings schema.
--- WHY  : One documented location defines every operator-configurable behavior.
--- WHERE: Merged into config.settings by config.load and rendered by UI.
--- HOW  : Plain Lua table with comments grouped by operating concern.
--- WHEN  : Read during load, validation, UI drawing, and save.
-config.DEFAULTS = {
-    debug = false, -- Print detailed decision trace.
-    mode = 'manual', -- Default operator mode: manual, camp, or follow.
-    followLeader = '', -- Clean name of preferred follow leader.
-    followDistance = 25, -- Desired leader distance for later follow navigation.
-    followRepathDistance = 35, -- Distance that would trigger a later repath.
-    useGroupAssist = true, -- Respect Main Assist when grouped.
-    requireMainAssist = true, -- Disable group offense if no Main Assist resolves.
-    assistAtPct = 95, -- Target HP threshold before group assist engages.
-    managePetTaunt = true, -- Future role-based pet taunt management.
-    tauntWhenSolo = true, -- Desired future solo pet taunt policy.
-    tauntWhenMainAssist = true, -- Desired future Magician-Main-Assist taunt policy.
-    emergencyPetTaunt = false, -- Optional future Main Assist emergency exception.
-    emergencyTauntAtPct = 30, -- Future emergency taunt activation threshold.
-    emergencyTauntReleasePct = 50, -- Future emergency taunt recovery threshold.
-    manageMercenary = true, -- Enable later mercenary policy when verified.
-    damageMercHoldDuringPull = true, -- Future damage-merc pull discipline.
-    healerMercHoldDuringPull = true, -- Future healer-merc pull discipline.
-    releaseHealerOnSelfDefense = true, -- Future healer emergency release.
-    enableSelfHpDefense = true, -- Future active-pull self-defense gate.
-    selfDefenseAtPct = 40, -- Future low-HP activation threshold.
-    selfDefenseReleasePct = 60, -- Future low-HP recovery threshold.
-    campReturnTolerance = 15, -- Future distance at which Magician is back at camp.
-    campEngageRadius = 35, -- Future target distance from camp before offense.
-    pullSearchRadius = 245, -- Future maximum target search radius.
-    spellOverrides = {}, -- Per-role explicit spell names; blank means auto.
-    spellGemMap = { primaryNuke = 1, secondaryNuke = 2, fastNuke = 3, debuff = 4 }, -- Future preferred gem map.
-    acquisitionMinLevel = 1, -- Spell Acquisition vendor scan lower level bound.
-    acquisitionMaxLevel = 0, -- Zero means current character level.
-    acquisitionMaxSpendPlat = 250, -- Future execution hard spending cap.
-    acquisitionPreviewOnly = true, -- 0.1 safety gate; prevents buy/scribe execution.
-} -- New settings must be added here with a comment.
-
--- WHAT : Live merged settings table.
--- WHY  : All modules need one immediate source of current operator choices.
--- WHERE: Read throughout package after config.load.
--- HOW  : Replaced as a whole on each successful load.
--- WHEN  : Valid after startup.
-config.settings = {} -- Empty until config.load runs.
-
---[[--------------------------------------------------------------------------
-  config.path()
-
-  WHAT  : Returns this server/character's settings-file path.
-  WHY   : Prevents one Magician's options from changing another's behavior.
-  WHERE : Called by config.load and config.save.
-  HOW   : Combines mq.configDir with safe server and character names.
-  WHEN  : Every settings file read/write.
-----------------------------------------------------------------------------]]
-function config.path()
-    local server = (mq.TLO.EverQuest.Server() or 'server'):gsub('%s+', '') -- Remove unsafe whitespace from server identifier.
-    local name = mq.TLO.Me.CleanName() or 'character' -- Use title-free character name.
-    return string.format('%s/magfarm_%s_%s.lua', mq.configDir, server, name) -- Match MacroQuest's config-folder convention.
+--[[
+FUNCTION: record(message)
+WHAT: Queues a timestamped settings event
+WHY: Make edits and persistence results observable without gameplay commands
+WHERE: set, reset, initialize and flush diagnostics
+HOW: Prefix local wall-clock time; retain at most 20 pending events
+WHEN: Only on an actual edit, load result, save result or explicit reset
+]]
+local function record(message)
+    table.insert(events, '[' .. os.date('%Y-%m-%d %H:%M:%S') .. '] Settings: ' .. message)
+    while #events > 20 do table.remove(events, 1) end
 end
 
---[[--------------------------------------------------------------------------
-  config.mergeDefaults(target, defaults)
+--[[
+FUNCTION: resourceText()
+WHAT: Formats the current validated threshold values
+WHY: Identify which values each diagnostic refers to
+WHERE: Pending, loaded and saved status messages
+HOW: Read in-memory HP and Mana values without file I/O
+WHEN: A status or event is constructed
+]]
+local function resourceText()
+    return string.format('HP=%d%%; Mana=%d%%', values.hpRedBelow, values.manaRedBelow)
+end
 
-  WHAT  : Adds any missing default values recursively to loaded settings.
-  WHY   : Old saved files must gain new settings after package upgrades.
-  WHERE : Called by config.load.
-  HOW   : Walks defaults; nested tables merge while scalar gaps receive copies.
-  WHEN  : Once per settings load.
-----------------------------------------------------------------------------]]
-function config.mergeDefaults(target, defaults)
-    for key, defaultValue in pairs(defaults) do -- Inspect each supported setting.
-        if target[key] == nil then target[key] = utils.deepCopy(defaultValue) -- Seed a missing value safely.
-        elseif type(defaultValue) == 'table' and type(target[key]) == 'table' then config.mergeDefaults(target[key], defaultValue) end -- Preserve existing nested choices while adding new keys.
+
+--[[
+FUNCTION: readIdentity()
+WHAT: Reads server and character
+WHY: Resolve storage identity
+WHERE: initialize protected call
+HOW: Read EverQuest.Server and Me.CleanName
+WHEN: At startup
+]]
+local function readIdentity()
+    return mq.TLO.EverQuest.Server(), mq.TLO.Me.CleanName()
+end
+
+--[[
+FUNCTION: encodeByte(c)
+WHAT: Encodes one unsafe filename byte
+WHY: Avoid filename ambiguity
+WHERE: encode replacement callback
+HOW: Use hexadecimal escape
+WHEN: On a non-safe byte
+]]
+local function encodeByte(c)
+    return string.format('_%02X', string.byte(c))
+end
+
+--[[
+FUNCTION: encode(text)
+WHAT: Makes identity filename-safe
+WHY: Separate characters without path injection
+WHERE: initialize filename construction
+HOW: Escape non-alphanumeric/non-hyphen bytes
+WHEN: At startup
+]]
+local function encode(text)
+    return (text:gsub('[^%w%-]', encodeByte))
+end
+
+--[[
+FUNCTION: saveFailure(err)
+WHAT: Records a failed save
+WHY: Avoid silent failure and repeated frame-loop retries
+WHERE: flush error paths
+HOW: Clear pending flag; retain in-memory values and report error
+WHEN: After a write/rename failure
+]]
+local function saveFailure(err)
+    dirty = false
+    statusText = 'Save failed at ' .. os.date('%Y-%m-%d %H:%M:%S') .. ': ' .. tostring(err)
+    record(statusText .. '; unsaved values: ' .. resourceText())
+    return false, statusText
+end
+
+--[[
+FUNCTION: get(key)
+WHAT: Returns a setting
+WHY: Hide internal storage
+WHERE: UI resource and Options rendering
+HOW: Look up the key
+WHEN: Whenever a consumer reads configuration
+]]
+function config.get(key)
+    return values[key]
+end
+
+--[[
+FUNCTION: set(key, value)
+WHAT: Validates and queues a setting edit
+WHY: Reject invalid numbers and persist changes
+WHERE: Options and startup loading
+HOW: Clamp finite input and round; mark changed values dirty
+WHEN: When a setting changes
+]]
+function config.set(key, value)
+    local definition = definitions[key]
+    if not definition then return false, 'Unknown setting' end
+    local number = tonumber(value)
+    if not number or number ~= number or number == math.huge or number == -math.huge then
+        return false, 'Expected a finite number'
     end
-end
-
---[[--------------------------------------------------------------------------
-  config.validate()
-
-  WHAT  : Repairs settings into supported ranges and compatible relationships.
-  WHY   : Hand edits and old defaults must never create impossible runtime rules.
-  WHERE : Called after load, before save, and after UI edits.
-  HOW   : Coerces booleans, clamps numbers, normalizes mode, and enforces paired
-          activation/recovery and camp-distance relationships.
-  WHEN  : Every configuration lifecycle event.
-----------------------------------------------------------------------------]]
-function config.validate()
-    local s = config.settings -- Short local reference for readable validation.
-    s.debug = utils.toBool(s.debug) -- Normalize Debug flag.
-    s.useGroupAssist = utils.toBool(s.useGroupAssist) -- Normalize group policy.
-    s.requireMainAssist = utils.toBool(s.requireMainAssist) -- Normalize assist lockout policy.
-    s.managePetTaunt = utils.toBool(s.managePetTaunt) -- Normalize future pet policy.
-    s.manageMercenary = utils.toBool(s.manageMercenary) -- Normalize future merc policy.
-    s.acquisitionPreviewOnly = utils.toBool(s.acquisitionPreviewOnly) -- Preserve 0.1 execution safety.
-    if s.mode ~= 'manual' and s.mode ~= 'camp' and s.mode ~= 'follow' then s.mode = 'manual' end -- Reject unknown saved modes.
-    s.followDistance = utils.clamp(s.followDistance, 5, 200) -- Keep future follow spacing practical.
-    s.followRepathDistance = utils.clamp(s.followRepathDistance, s.followDistance, 400) -- Ensure repath threshold is never smaller than desired distance.
-    s.assistAtPct = utils.clamp(s.assistAtPct, 1, 100) -- Valid target-health percentage.
-    s.emergencyTauntAtPct = utils.clamp(s.emergencyTauntAtPct, 1, 99) -- Keep a recovery value possible.
-    s.emergencyTauntReleasePct = utils.clamp(s.emergencyTauntReleasePct, s.emergencyTauntAtPct, 100) -- Enforce taunt hysteresis.
-    s.selfDefenseAtPct = utils.clamp(s.selfDefenseAtPct, 1, 99) -- Keep recovery value possible.
-    s.selfDefenseReleasePct = utils.clamp(s.selfDefenseReleasePct, s.selfDefenseAtPct, 100) -- Enforce self-defense hysteresis.
-    s.campReturnTolerance = utils.clamp(s.campReturnTolerance, 3, 100) -- Supported future camp return range.
-    s.campEngageRadius = utils.clamp(s.campEngageRadius, s.campReturnTolerance, 250) -- Target gate must not be smaller than return tolerance.
-    s.pullSearchRadius = utils.clamp(s.pullSearchRadius, s.campEngageRadius, 1000) -- Search must reach at least the camp gate.
-    s.acquisitionMinLevel = utils.clamp(s.acquisitionMinLevel, 1, 125) -- Safe level range for scan planning.
-    s.acquisitionMaxLevel = utils.clamp(s.acquisitionMaxLevel, 0, 125) -- Zero keeps the current-level semantic.
-    s.acquisitionMaxSpendPlat = utils.clamp(s.acquisitionMaxSpendPlat, 0, 10000000) -- Avoid nonsensical negative limits.
-    if type(s.spellOverrides) ~= 'table' then s.spellOverrides = {} end -- Repair bad hand-edited role data.
-    if type(s.spellGemMap) ~= 'table' then s.spellGemMap = utils.deepCopy(config.DEFAULTS.spellGemMap) end -- Repair gem map shape.
-end
-
---[[--------------------------------------------------------------------------
-  config.load()
-
-  WHAT  : Loads saved settings, merges defaults, validates them, and binds Debug.
-  WHY   : Starts correctly on first run, after upgrades, and after safe recovery
-          from a malformed user-edited settings file.
-  WHERE : Called once by init.lua startup.
-  HOW   : Runs loadfile under pcall, merges DEFAULTS, validates, then publishes.
-  WHEN  : Before any module makes a configuration-dependent decision.
-----------------------------------------------------------------------------]]
-function config.load()
-    local loaded = {} -- First-run fallback settings container.
-    local chunk = loadfile(config.path()) -- Compile saved table file if it exists.
-    if chunk then -- Existing file compiled successfully.
-        local ok, data = pcall(chunk) -- Protect startup from runtime errors in hand edits.
-        if ok and type(data) == 'table' then loaded = data else utils.echo('\aySettings file invalid; using defaults.') end -- Retain defaults on invalid content.
+    number = math.floor(math.max(definition.minimum, math.min(definition.maximum, number)) + 0.5)
+    if values[key] ~= number then
+        local previous = values[key]
+        values[key] = number
+        dirty = true
+        if not loading then
+            record(string.format('Changed %s: %d -> %d; save pending.', key, previous, number))
+        end
     end
-    config.mergeDefaults(loaded, config.DEFAULTS) -- Add upgrade-time keys without overwriting choices.
-    config.settings = loaded -- Publish before validation so helper calls read live data.
-    config.validate() -- Repair all values and relationships.
-    utils.bindDebugFlag(function() return config.settings.debug == true end) -- Inject Debug reader without a require cycle.
-    utils.debug('Settings loaded from %s', config.path()) -- Trace load source when requested.
+    return true
 end
 
---[[--------------------------------------------------------------------------
-  config.save()
-
-  WHAT  : Persists current validated settings to the character/server file.
-  WHY   : Operator choices must survive a reload or later play session.
-  WHERE : Called by UI Save and init.lua clean shutdown.
-  HOW   : Validates then serializes the table through mq.pickle under pcall.
-  WHEN  : On explicit request and clean package exit.
-----------------------------------------------------------------------------]]
-function config.save()
-    config.validate() -- Never save malformed settings.
-    local ok, err = pcall(mq.pickle, config.path(), config.settings) -- Serialize safely through MacroQuest.
-    if not ok then utils.echo('\arCould not save settings: %s', tostring(err)) else utils.debug('Settings saved to %s', config.path()) end -- Report failure only when necessary.
+--[[
+FUNCTION: reset()
+WHAT: Restores defaults and queues their save
+WHY: Reset must persist, not only alter the display
+WHERE: Options reset button
+HOW: Copy defaults and always mark dirty
+WHEN: On explicit operator reset
+]]
+function config.reset()
+    for key, definition in pairs(definitions) do values[key] = definition.default end
+    dirty = true
+    record('Reset requested; save pending: ' .. resourceText())
 end
 
-return config -- Export persistent configuration services.
+--[[
+FUNCTION: initialize()
+WHAT: Loads this server and character settings
+WHY: Keep character preferences independent
+WHERE: Entry-point startup
+HOW: Read identity and parse non-executable schema-1 text
+WHEN: Before UI registration
+]]
+function config.initialize()
+    local ok, server, character = pcall(readIdentity)
+    if not ok or not server or server == '' or not character or character == '' or not mq.configDir then
+        statusText = 'Persistence unavailable: identity or config directory missing'
+        record(statusText)
+        return false, statusText
+    end
+    path = mq.configDir .. '/MagFarm_' .. encode(server) .. '_' .. encode(character) .. '.settings'
+    blocked = false
+    for key, definition in pairs(definitions) do values[key] = definition.default end
+    dirty = false
+    local handle = io.open(path, 'r')
+    if not handle then
+        statusText = 'Defaults active; settings will be created on edit'
+        record(statusText .. '; ' .. resourceText())
+        return true
+    end
+    local content = handle:read('*a')
+    handle:close()
+    if not content then statusText = 'Load failed; defaults active'; blocked = true; record(statusText); return false, statusText end
+    local parsed = {}
+    for line in content:gmatch('[^\r\n]+') do
+        local key, value = line:match('^([%w]+)=([^\r\n]+)$')
+        if key then parsed[key] = value end
+    end
+    if tonumber(parsed.schemaVersion) ~= 1 then
+        blocked = true
+        statusText = 'Unsupported settings schema; defaults active; file preserved'
+        record(statusText)
+        return false, statusText
+    end
+    loading = true
+    for key in pairs(definitions) do if parsed[key] then config.set(key, parsed[key]) end end
+    loading = false
+    dirty = false
+    statusText = 'Loaded at ' .. os.date('%Y-%m-%d %H:%M:%S') .. '; ' .. resourceText() .. '\nFile: ' .. path
+    record(statusText)
+    return true
+end
 
---[[==========================================================================
-  END OF FILE : magfarm/config.lua
+--[[
+FUNCTION: flush()
+WHAT: Saves pending edits including resets
+WHY: Keep file I/O outside rendering and retain the previous file
+WHERE: Main-loop tick and shutdown
+HOW: Write a temporary file; back up existing data; replace or restore on failure
+WHEN: When dirty settings are pending
+]]
+function config.flush()
+    if not dirty then return true end
+    if not path or blocked then return false, statusText end
+    local temporary, backup = path .. '.tmp', path .. '.bak'
+    local handle, err = io.open(temporary, 'w')
+    if not handle then return saveFailure(err) end
+    local written, writeError = handle:write(string.format(
+        'schemaVersion=1\nhpRedBelow=%d\nmanaRedBelow=%d\n', values.hpRedBelow, values.manaRedBelow))
+    local closed, closeError = handle:close()
+    if not written or not closed then os.remove(temporary); return saveFailure(writeError or closeError) end
+    local existing = io.open(path, 'r')
+    if existing then
+        existing:close()
+        os.remove(backup)
+        local moved, moveError = os.rename(path, backup)
+        if not moved then os.remove(temporary); return saveFailure(moveError) end
+    end
+    local saved, saveError = os.rename(temporary, path)
+    if not saved then
+        local rollbackError
+        if existing then
+            local restored
+            restored, rollbackError = os.rename(backup, path)
+            if restored then rollbackError = nil end
+        end
+        os.remove(temporary)
+        return saveFailure(tostring(saveError) .. (rollbackError and '; rollback failed: ' .. tostring(rollbackError) or ''))
+    end
+    dirty = false
+    saveCount = saveCount + 1
+    statusText = string.format('Saved #%d at %s; %s\nFile: %s',
+        saveCount, os.date('%Y-%m-%d %H:%M:%S'), resourceText(), path)
+    record(statusText)
+    return true
+end
 
-  EXPORTS
-    DEFAULTS                 Complete documented settings table.
-    settings                 Live merged settings.
-    path()                   Per-server/per-character file path.
-    mergeDefaults(t,d)       Upgrade-safe default merge.
-    validate()               Repair ranges and relationships.
-    load() / save()          Persisted settings lifecycle.
+--[[
+FUNCTION: status()
+WHAT: Returns load/save status
+WHY: Expose persistence results and failures
+WHERE: Options status line
+HOW: Show pending values separately from the last completed result
+WHEN: During visible rendering
+]]
+function config.status()
+    if dirty then
+        local state = (not path or blocked) and 'Pending but persistence unavailable: ' or 'Pending save: '
+        return state .. resourceText() .. '\nLast result: ' .. statusText
+    end
+    return statusText
+end
 
-  DEPENDENCIES : mq, magfarm.utils.
+--[[
+FUNCTION: drainEvents()
+WHAT: Returns and clears pending settings diagnostics
+WHY: Let the UI consume each event once without repeated per-tick logging
+WHERE: The UI main-loop tick, after flush; never required for saving
+HOW: Transfer the bounded event array and replace it with an empty array
+WHEN: Each tick after the UI event integration is installed
+]]
+function config.drainEvents()
+    local pending = events
+    events = {}
+    return pending
+end
 
-  HOW TO EDIT SAFELY
-    - Add every new persistent option to DEFAULTS with a comment.
-    - Add validation here before using numeric or related settings elsewhere.
-    - Do not store transient target, pull, or UI state here; use runtime.lua.
-==========================================================================]]--
+return config
+--[[
+FOOTER: config.lua
+EXPORTS: get, set, reset, initialize, flush, status, drainEvents
+DEFAULTS: hpRedBelow=35; manaRedBelow=35. Comparison remains strictly below.
+FORMAT: schemaVersion=1; compatible with existing v0.3.5 .settings files.
+RESET FIX: reset always sets dirty=true; the next tick saves 35/35.
+ERRORS: In-memory changes survive save failure; edit/reset to retry.
+Unknown schemas remain untouched. Backup recovery after a crash is manual.
+DIAGNOSTICS: Save counter is session-local; timestamps use local wall-clock time.
+Pending values are not labelled saved. Events are bounded and consumable once.
+The settings-file format, defaults, backup and rollback logic are unchanged.
+DOCUMENTATION: Every function describes what, why, where, how and when.
+END OF FILE
+]]

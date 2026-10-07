@@ -1,302 +1,470 @@
---[[==========================================================================
-  FILE        : magfarm/state.lua
-  PACKAGE     : MagFarm Lua  (MacroQuest / EverQuest)
-  VERSION     : 0.1.0
-  CHANGES     : 0.1.0  Initial state-machine control foundation.
+--[[
+==============================================================================
+FILE    : magfarm/state.lua
+PACKAGE : MagFarm
+VERSION : 0.3.4
 
-  WHAT  : Owns Start, Pause, Resume, Stop, mode preparation, status refresh,
-          camp capture, and Spell Acquisition scan transitions.
-  WHY   : Explicit state makes behavior visible, pausable, and extensible
-          without nested macro loops or hidden goto control flow.
-  WHERE : Called by init.lua's main loop and requested by ui.lua/commands.
-  HOW   : Dispatches one short handler per state; handlers never run combat or
-          unverified movement/mercenary/vendor commands in version 0.1.
-  WHEN  : Once per main-loop pass while loaded.
-==========================================================================]]--
+WHAT :
+Collects read-only character, local roster, group roles, pet, target, casting,
+spell-readiness, and spell-gem snapshots.
 
-local mq = require('mq') -- Character/location TLO access.
-local config = require('magfarm.config') -- Mode and policy settings.
-local runtime = require('magfarm.runtime') -- Live state and log.
-local utils = require('magfarm.utils') -- Operator output.
-local spells = require('magfarm.spells') -- Spellbook scan.
-local assist = require('magfarm.assist') -- Group/Main Assist status.
-local pet = require('magfarm.pet') -- Pet status.
-local merc = require('magfarm.merc') -- Mercenary status.
-local follow = require('magfarm.follow') -- Follow-leader validation.
-local acquisition = require('magfarm.spell_acquisition') -- Spell Acquisition preview.
-local state = {} -- Module export table.
+WHY :
+Rendering should consume data rather than perform game-state lookups.
+Role assignments must be independent, and unknown data must not become a
+false zero or an assumed unassigned role.
 
---[[--------------------------------------------------------------------------
-  state.refreshStatus()
+WHERE :
+Required by magfarm/ui.lua. capture() is called once per visible frame.
 
-  WHAT  : Refreshes read-only module status in a consistent dependency order.
-  WHY   : Pet policy depends on assist group status, and UI needs current facts.
-  WHERE : Called by prepare and every active-state tick.
-  HOW   : Refreshes assist first, then pet/merc/follow conditionally.
-  WHEN  : At startup, state transitions, and active loop updates.
-----------------------------------------------------------------------------]]
-function state.refreshStatus()
-    assist.refresh() -- Group ownership must be current before pet policy calculates.
-    pet.refresh() -- Pet policy reads assist status.
-    merc.refresh() -- Mercenary status is independent but shown alongside pet.
-    if runtime.mode == 'follow' then follow.refresh() end -- Follow roster check only matters in Follow mode.
+HOW :
+Scans numeric Group.Member slots 0 through 5.
+Captures each verified role flag independently.
+Preserves missing roster resources as nil and role validity separately.
+
+WHEN :
+Whenever ui.render() captures a monitor snapshot.
+
+COMPATIBILITY :
+Group.Members is not used as the roster length.
+Name-indexed Group.Member lookup is not used.
+Numeric slots are the validated roster source on the tested client.
+Remote mana remains group-reported and has shown inconsistent readings.
+
+ROLE MODEL :
+member.roles contains true/false when known, nil when unknown.
+member.rolesKnown distinguishes known readings from missing/failed readings.
+Leader identity is captured separately through Group.Leader.Name.
+No role is inferred from Main Assist, Main Tank, or another assignment.
+
+RAID ROADMAP :
+Roster records remain reusable. Raid data collection is not implemented.
+
+SAFETY :
+No commands, targeting, casting, movement, pet control, loot, inventory,
+role assignments, or raid reads.
+==============================================================================
+]]--
+
+local mq = require('mq')
+local state = {}
+
+--- Validated client profile limits, isolated in collection rather than the UI.
+local FIRST_GROUP_SLOT = 0
+local LAST_GROUP_SLOT = 5
+local FIRST_SPELL_GEM = 1
+local LAST_SPELL_GEM = 12
+
+--- Stable role keys mapped to validated Group.Member Boolean members.
+local ROLE_FIELDS = {
+    { key = 'mainTank', field = 'MainTank' },
+    { key = 'mainAssist', field = 'MainAssist' },
+    { key = 'puller', field = 'Puller' },
+    { key = 'markNpc', field = 'MarkNpc' },
+    { key = 'masterLooter', field = 'MasterLooter' },
+}
+
+--[[
+------------------------------------------------------------------------------
+FUNCTION : normalize(value, fallback)
+WHAT : Converts absent text values into a supplied fallback.
+WHY : nil, empty strings, and NULL are normal absent TLO results.
+WHERE : Snapshot collection helpers and capture().
+HOW : Converts usable values to text and rejects empty/NULL text.
+WHEN : Each optional string is collected.
+------------------------------------------------------------------------------
+]]
+local function normalize(value, fallback)
+    if value == nil then
+        return fallback
+    end
+
+    local text = tostring(value)
+    if text == '' or text:upper() == 'NULL' then
+        return fallback
+    end
+
+    return text
 end
 
---[[--------------------------------------------------------------------------
-  state.start()
-
-  WHAT  : Starts the configured operating mode after resetting volatile state.
-  WHY   : UI and slash commands must share one reliable run entry point.
-  WHERE : Called by ui.lua and init.lua command handler.
-  HOW   : Prevents duplicate starts, resets run data, marks running, and enters
-          PREPARE where preflight can pause visibly on failure.
-  WHEN  : On explicit operator Start request.
-----------------------------------------------------------------------------]]
-function state.start()
-    if runtime.running then utils.echo('\ayMagFarm is already running.') return end -- Refuse duplicate run initialization.
-    runtime.resetRun() -- Remove stale target/pull/emergency facts.
-    runtime.mode = config.settings.mode -- Adopt persisted selected mode.
-    runtime.running = true -- Allow state.tick to dispatch work.
-    runtime.setState(runtime.STATE.PREPARE, 'Running preflight checks.') -- Make startup visible.
+--[[
+------------------------------------------------------------------------------
+FUNCTION : numberOr(value, fallback)
+WHAT : Converts a numeric value while preserving the selected fallback.
+WHY : Unknown roster resources must remain nil rather than become zero.
+WHERE : Numeric snapshot fields.
+HOW : Rejects missing and non-finite numeric results.
+WHEN : Each numeric field is collected.
+------------------------------------------------------------------------------
+]]
+local function numberOr(value, fallback)
+    local number = tonumber(value)
+    if not number or number ~= number or
+        number == math.huge or number == -math.huge then
+        return fallback
+    end
+    return number
 end
 
---[[--------------------------------------------------------------------------
-  state.stop(reason)
+--[[
+------------------------------------------------------------------------------
+FUNCTION : booleanValue(value)
+WHAT : Converts supported Boolean forms to true/false, preserving unknowns.
+WHY : Missing roles must not silently appear unassigned.
+WHERE : Role, presence, and death reads.
+HOW : Recognizes native Boolean values and TRUE/FALSE/1/0 text.
+WHEN : Each Boolean field is collected.
+RETURNS : true, false, or nil.
+------------------------------------------------------------------------------
+]]
+local function booleanValue(value)
+    if value == true or value == false then
+        return value
+    end
 
-  WHAT  : Stops current activity safely and returns to Idle.
-  WHY   : Operators need immediate control without unloading the UI/package.
-  WHERE : Called by UI, slash commands, and future safety handlers.
-  HOW   : Clears running/pause intent and transitions to IDLE; command-producing
-          modules are not active in 0.1, so no external stop command is needed.
-  WHEN  : On explicit Stop or future unrecoverable safety event.
-----------------------------------------------------------------------------]]
-function state.stop(reason)
-    runtime.running = false -- Prevent further active handler dispatch.
-    runtime.resumeState = nil -- Stop is final, unlike Pause.
-    runtime.setState(runtime.STATE.IDLE, reason or 'Stopped by operator.') -- Publish idle state and rationale.
-    utils.echo('\ayMagFarm stopped%s.', reason and (': ' .. reason) or '') -- Give immediate chat confirmation.
+    if value == nil then
+        return nil
+    end
+
+    local text = tostring(value):upper()
+    if text == 'TRUE' or text == '1' then
+        return true
+    end
+    if text == 'FALSE' or text == '0' then
+        return false
+    end
+    return nil
 end
 
---[[--------------------------------------------------------------------------
-  state.pause(reason)
-
-  WHAT  : Pauses current activity while retaining its resume destination.
-  WHY   : Maintenance, review, and safety checks should not discard context.
-  WHERE : Called by UI, slash commands, acquisition, and future safety logic.
-  HOW   : Stores current state once and transitions to PAUSED.
-  WHEN  : On explicit Pause or a visible preflight/safety issue.
-----------------------------------------------------------------------------]]
-function state.pause(reason)
-    if runtime.state ~= runtime.STATE.PAUSED then runtime.resumeState = runtime.state end -- Preserve first meaningful origin.
-    runtime.setState(runtime.STATE.PAUSED, reason or 'Paused by operator.') -- Publish paused state.
-    utils.echo('\ayMagFarm paused: %s', runtime.status) -- Make pause reason clear in chat.
+--[[
+------------------------------------------------------------------------------
+FUNCTION : invokeMemberField(member, field)
+WHAT : Invokes one dynamically selected member field.
+WHY : Provides a named protected-call target without duplicating accessors.
+WHERE : readMemberField().
+HOW : Indexes the TLO member by validated field name and invokes it.
+WHEN : Inside a protected read.
+------------------------------------------------------------------------------
+]]
+local function invokeMemberField(member, field)
+    return member[field]()
 end
 
---[[--------------------------------------------------------------------------
-  state.resume()
-
-  WHAT  : Restores the state saved by Pause when safe to do so.
-  WHY   : Pause should not force a full restart or hide the original context.
-  WHERE : Called by UI and slash commands.
-  HOW   : Uses saved state or PREPARE fallback, then clears the saved value.
-  WHEN  : Only while currently PAUSED.
-----------------------------------------------------------------------------]]
-function state.resume()
-    if runtime.state ~= runtime.STATE.PAUSED then utils.echo('\ayMagFarm is not paused.') return end -- Reject invalid resume requests.
-    local nextState = runtime.resumeState or runtime.STATE.PREPARE -- Choose preserved origin or safe preflight.
-    runtime.resumeState = nil -- Consume one-time resume context.
-    runtime.setState(nextState, 'Resumed by operator.') -- Publish resumed state.
+--[[
+------------------------------------------------------------------------------
+FUNCTION : readMemberField(member, field)
+WHAT : Reads an optional member field without propagating an access error.
+WHY : One unavailable field should not interrupt the entire roster.
+WHERE : Role and resource collection.
+HOW : Protects invokeMemberField() with pcall.
+WHEN : Each optional member field is collected.
+RETURNS : Raw result, or nil if access fails.
+------------------------------------------------------------------------------
+]]
+local function readMemberField(member, field)
+    local ok, value = pcall(invokeMemberField, member, field)
+    if not ok then
+        return nil
+    end
+    return value
 end
 
---[[--------------------------------------------------------------------------
-  state.setMode(mode)
-
-  WHAT  : Changes the requested operator mode and persists it in live settings.
-  WHY   : Mode is an operator choice, while current runtime state is transient.
-  WHERE : Called by UI and slash commands.
-  HOW   : Validates three supported names, updates config, and logs result.
-  WHEN  : While idle/paused; active behavior adopts it on next Start.
-----------------------------------------------------------------------------]]
-function state.setMode(mode)
-    local value = tostring(mode or ''):lower() -- Normalize command/UI input.
-    if value ~= 'manual' and value ~= 'camp' and value ~= 'follow' then utils.echo('\arUnknown mode: %s', value) return false end -- Reject unsupported modes.
-    config.settings.mode = value -- Store future-start preference.
-    runtime.mode = value -- Update immediate UI display.
-    runtime.note('Mode selected: %s', value) -- Record operator decision.
-    return true -- Signal UI command success.
+--[[
+------------------------------------------------------------------------------
+FUNCTION : memberAt(slot)
+WHAT : Resolves one numeric group slot.
+WHY : Keeps numeric slot access isolated for protected collection.
+WHERE : captureRoster().
+HOW : Returns mq.TLO.Group.Member(slot).
+WHEN : Each of the six supported slots is scanned.
+------------------------------------------------------------------------------
+]]
+local function memberAt(slot)
+    return mq.TLO.Group.Member(slot)
 end
 
---[[--------------------------------------------------------------------------
-  state.setCamp()
-
-  WHAT  : Saves the Magician's current coordinates as camp.
-  WHY   : Camp behavior must never infer a location without explicit operator intent.
-  WHERE : Called by UI and `/magfarm camp`.
-  HOW   : Reads Me.Y/X/Z and delegates storage to runtime.setCamp.
-  WHEN  : On explicit operator request.
-----------------------------------------------------------------------------]]
-function state.setCamp()
-    runtime.setCamp(mq.TLO.Me.Y() or 0, mq.TLO.Me.X() or 0, mq.TLO.Me.Z() or 0) -- Capture current in-zone location.
-    utils.echo('\agCamp recorded.') -- Confirm the operator action.
+--[[
+------------------------------------------------------------------------------
+FUNCTION : memberClass(member)
+WHAT : Reads a member's short class name.
+WHY : Class is nested and may not be available when the member is absent.
+WHERE : captureRoster(), through a protected call.
+HOW : Invokes member.Class.ShortName().
+WHEN : An occupied group slot is captured.
+------------------------------------------------------------------------------
+]]
+local function memberClass(member)
+    return member.Class.ShortName()
 end
 
---[[--------------------------------------------------------------------------
-  state.requestAcquisitionScan()
-
-  WHAT  : Starts the scan-only Spell Acquisition maintenance workflow.
-  WHY   : Acquisition must pause normal behavior and stay operator-controlled.
-  WHERE : Called by UI and `/magfarm acquire scan`.
-  HOW   : Pauses an active run if needed, marks running, and enters scan state.
-  WHEN  : Only by explicit operator request.
-----------------------------------------------------------------------------]]
-function state.requestAcquisitionScan()
-    if runtime.running and runtime.state ~= runtime.STATE.PAUSED then state.pause('Spell Acquisition requested.') end -- Preserve active context before maintenance.
-    runtime.running = true -- Permit acquisition state dispatch when launched from idle.
-    runtime.setState(runtime.STATE.ACQUISITION_SCAN, 'Scanning spell acquisition environment.') -- Show job start.
+--[[
+------------------------------------------------------------------------------
+FUNCTION : leaderNameRead()
+WHAT : Reads the current group leader name.
+WHY : Leader identity must not be inferred from slot zero.
+WHERE : captureRoster(), through a protected call.
+HOW : Reads Group.Leader.Name().
+WHEN : Each roster capture.
+------------------------------------------------------------------------------
+]]
+local function leaderNameRead()
+    return mq.TLO.Group.Leader.Name()
 end
 
---[[--------------------------------------------------------------------------
-  state.prepare()
+--[[
+------------------------------------------------------------------------------
+FUNCTION : captureRoles(member)
+WHAT : Captures independently assigned group-role flags.
+WHY : Roles can overlap, remain unassigned, or have unavailable telemetry.
+WHERE : captureRoster().
+HOW : Reads each validated role field and stores value and known-state maps.
+WHEN : Each occupied member is captured.
+RETURNS : roles, rolesKnown.
+------------------------------------------------------------------------------
+]]
+local function captureRoles(member)
+    local roles = {}
+    local known = {}
 
-  WHAT  : Performs safe preflight and transitions into requested operating mode.
-  WHY   : A bad class, absent camp, or unresolved follow leader should be visible
-          before later automation can issue meaningful commands.
-  WHERE : PREPARE handler.
-  HOW   : Validates MAG class, scans spellbook, refreshes status, then routes to
-          Manual, Camp Idle, or Follow; failures pause instead of stopping.
-  WHEN  : At every Start and any Resume that returns to PREPARE.
-----------------------------------------------------------------------------]]
-function state.prepare()
-    if (mq.TLO.Me.Class.ShortName() or '') ~= 'MAG' then state.pause('MagFarm is designed for MAG; no behavior started.') return end -- Enforce package scope.
-    spells.detect() -- Build current role selections before status/UI needs them.
-    state.refreshStatus() -- Build group/pet/merc/follow facts in correct order.
-    if runtime.mode == 'camp' and not runtime.camp then state.pause('Camp mode requires Set Camp before Start.') return end -- Require explicit camp anchor.
-    if runtime.mode == 'follow' and not follow.status.valid then state.pause(follow.status.reason) return end -- Refuse invisible/invalid follow behavior.
-    if runtime.mode == 'manual' then runtime.setState(runtime.STATE.MANUAL, 'Manual mode active.') -- Enter inert manual state.
-    elseif runtime.mode == 'camp' then runtime.setState(runtime.STATE.CAMP_IDLE, 'Camp foundation active; pulling is not enabled in 0.1.') -- Show intentionally staged scope.
-    else runtime.setState(runtime.STATE.FOLLOW, 'Follow preview active; movement is not enabled in 0.1.') end -- Show intentionally staged scope.
+    for _, definition in ipairs(ROLE_FIELDS) do
+        local value = booleanValue(readMemberField(member, definition.field))
+        roles[definition.key] = value
+        known[definition.key] = value ~= nil
+    end
+
+    return roles, known
 end
 
---[[--------------------------------------------------------------------------
-  state.manual()
+--[[
+------------------------------------------------------------------------------
+FUNCTION : captureRoster(character)
+WHAT : Collects occupied local group slots and their independent roles.
+WHY : Supplies a generic roster without relying on the observed count issue.
+WHERE : state.capture().
+HOW : Scans slots 0..5, retains valid names, protects optional reads, and uses
+      Me-derived resources for the local character.
+WHEN : Once per visible snapshot.
+NOTE : Does not invent a synthetic solo row if Group provides no occupied slot.
+------------------------------------------------------------------------------
+]]
+local function captureRoster(character)
+    local leaderOk, rawLeader = pcall(leaderNameRead)
+    local leader = leaderOk and normalize(rawLeader, '') or ''
+    local members = {}
 
-  WHAT  : Services Manual mode with safe status refresh only.
-  WHY   : Version 0.1 should be useful for monitoring without autonomous action.
-  WHERE : MANUAL handler.
-  HOW   : Refreshes group/pet/merc facts and returns immediately.
-  WHEN  : Every active main-loop pass in Manual mode.
-----------------------------------------------------------------------------]]
-function state.manual()
-    state.refreshStatus() -- Keep visible facts current without game actions.
+    for slot = FIRST_GROUP_SLOT, LAST_GROUP_SLOT do
+        local ok, member = pcall(memberAt, slot)
+
+        if ok and member then
+            local name = normalize(readMemberField(member, 'Name'), '')
+
+            if name ~= '' then
+                local isSelf = name == character.name
+                local classOk, rawClass = pcall(memberClass, member)
+                local roles, rolesKnown = captureRoles(member)
+                local reportedLeader =
+                    booleanValue(readMemberField(member, 'Leader'))
+
+                local isLeader = nil
+                if leader ~= '' then
+                    isLeader = name == leader
+                elseif reportedLeader ~= nil then
+                    isLeader = reportedLeader
+                end
+
+                local hp = numberOr(readMemberField(member, 'PctHPs'), nil)
+                local mana = numberOr(readMemberField(member, 'PctMana'), nil)
+
+                if isSelf then
+                    hp = character.hp
+                    mana = character.mana
+                end
+
+                table.insert(members, {
+                    name = name,
+                    classShortName =
+                        classOk and normalize(rawClass, '--') or '--',
+                    hpPct = hp,
+                    manaPct = mana,
+                    distance =
+                        numberOr(readMemberField(member, 'Distance'), nil),
+                    present =
+                        booleanValue(readMemberField(member, 'Present')),
+                    dead =
+                        booleanValue(readMemberField(member, 'Dead')),
+                    isSelf = isSelf,
+                    isLeader = isLeader,
+                    roles = roles,
+                    rolesKnown = rolesKnown,
+                    groupSlot = slot,
+                    manaSource = isSelf and 'local' or 'group-reported',
+                })
+            end
+        end
+    end
+
+    return {
+        scope = 'group',
+        leaderName = leader,
+        memberCount = #members,
+        source = {
+            type = 'group',
+            firstSlot = FIRST_GROUP_SLOT,
+            lastSlot = LAST_GROUP_SLOT,
+        },
+        members = members,
+    }
 end
 
---[[--------------------------------------------------------------------------
-  state.campIdle()
-
-  WHAT  : Services staged Camp mode without autonomous pulling in 0.1.
-  WHY   : Preserves architecture and observability before pull commands are tested.
-  WHERE : CAMP_IDLE handler.
-  HOW   : Refreshes status and keeps a clear staged-feature message.
-  WHEN  : Every active main-loop pass in Camp mode.
-----------------------------------------------------------------------------]]
-function state.campIdle()
-    state.refreshStatus() -- Keep pet/merc/group facts current.
-    runtime.status = 'Camp foundation active; autonomous pulling is deferred for client-tested milestone 0.2.' -- Make scope unambiguous.
+--[[
+------------------------------------------------------------------------------
+FUNCTION : targetSafety(typeName, exists)
+WHAT : Classifies the selected target for informational display.
+WHY : Target selection must never imply permission to act.
+WHERE : state.capture().
+HOW : Maps absent, NPC, PC, and other target types to text classifications.
+WHEN : Each snapshot.
+------------------------------------------------------------------------------
+]]
+local function targetSafety(typeName, exists)
+    if not exists then
+        return 'NONE',
+            'No target selected. Monitor only; no target will be acquired.'
+    end
+    if typeName == 'NPC' then
+        return 'NPC',
+            'NPC selected. Informational only; MagFarm will not attack or act.'
+    end
+    if typeName == 'PC' then
+        return 'PC',
+            'Player character selected. Never a valid combat target.'
+    end
+    return 'OTHER', string.format(
+        '%s selected. Inspect manually; MagFarm will not act on this target.',
+        typeName
+    )
 end
 
---[[--------------------------------------------------------------------------
-  state.follow()
+--[[
+------------------------------------------------------------------------------
+FUNCTION : state.capture(readinessSpell)
+WHAT : Builds the complete read-only monitor snapshot.
+WHY : Keeps TLO collection separate from rendering and configuration.
+WHERE : ui.render().
+HOW : Collects the existing character/pet/target/spell fields and local roster.
+WHEN : Once per visible UI frame.
+PARAMETER : readinessSpell is an optional read-only Me.SpellReady query.
+------------------------------------------------------------------------------
+]]
+function state.capture(readinessSpell)
+    local character = {
+        name = normalize(mq.TLO.Me.Name(), 'Unknown'),
+        level = numberOr(mq.TLO.Me.Level(), 0),
+        class = normalize(mq.TLO.Me.Class.ShortName(), '?'),
+        hp = numberOr(mq.TLO.Me.PctHPs(), nil),
+        mana = numberOr(mq.TLO.Me.PctMana(), nil),
+        zone = normalize(mq.TLO.Zone.Name(), 'Unknown'),
+    }
 
-  WHAT  : Services Follow preview mode without movement commands in 0.1.
-  WHY   : Leader resolution should be tested before enabling MQ2Nav automation.
-  WHERE : FOLLOW handler.
-  HOW   : Refreshes status and pauses if leader becomes invalid.
-  WHEN  : Every active main-loop pass in Follow mode.
-----------------------------------------------------------------------------]]
-function state.follow()
-    state.refreshStatus() -- Refresh leader/pet/merc/group status.
-    if not follow.status.valid then state.pause(follow.status.reason) return end -- Never follow an invalid leader.
-    runtime.status = follow.status.reason -- Explain that 0.1 is observation-only.
+    local petName = normalize(mq.TLO.Me.Pet.Name(), '')
+    local petTarget = normalize(mq.TLO.Me.Pet.Target.CleanName(), '')
+    local targetName = normalize(mq.TLO.Target.CleanName(), '')
+    local targetType = normalize(mq.TLO.Target.Type(), 'None')
+    local castingName = normalize(mq.TLO.Me.Casting.Name(), '')
+    local targetExists = targetName ~= ''
+    local safetyKind, safetyText = targetSafety(targetType, targetExists)
+
+    local petState = 'No pet summoned'
+    if petName ~= '' then
+        petState = petTarget == '' and 'Idle' or 'Targeting ' .. petTarget
+    end
+
+    local gems = {}
+    for slot = FIRST_SPELL_GEM, LAST_SPELL_GEM do
+        local name = normalize(mq.TLO.Me.Gem(slot).Name(), '')
+        gems[slot] = {
+            slot = slot,
+            name = name == '' and 'Empty' or name,
+            empty = name == '',
+        }
+    end
+
+    local selectedSpell = normalize(readinessSpell, '')
+    local ready = false
+    if selectedSpell ~= '' then
+        ready = mq.TLO.Me.SpellReady(selectedSpell)() == true
+    end
+
+    return {
+        character = character,
+        roster = captureRoster(character),
+
+        pet = {
+            name = petName == '' and 'None' or petName,
+            id = numberOr(mq.TLO.Me.Pet.ID(), 0),
+            hp = numberOr(mq.TLO.Me.Pet.PctHPs(), nil),
+            distance = numberOr(mq.TLO.Me.Pet.Distance(), 0),
+            targetName = petTarget == '' and 'None' or petTarget,
+            targetId = numberOr(mq.TLO.Me.Pet.Target.ID(), 0),
+            state = petState,
+            exists = petName ~= '',
+        },
+
+        target = {
+            name = targetName == '' and 'None' or targetName,
+            id = numberOr(mq.TLO.Target.ID(), 0),
+            level = numberOr(mq.TLO.Target.Level(), 0),
+            hp = numberOr(mq.TLO.Target.PctHPs(), nil),
+            distance = numberOr(mq.TLO.Target.Distance(), 0),
+            type = targetType,
+            aggroHolder = normalize(mq.TLO.Target.AggroHolder.Name(), 'None'),
+            exists = targetExists,
+            safetyKind = safetyKind,
+            safetyText = safetyText,
+        },
+
+        casting = {
+            name = castingName == '' and 'None' or castingName,
+            id = numberOr(mq.TLO.Me.Casting.ID(), 0),
+            active = castingName ~= '',
+        },
+
+        readiness = {
+            spell = selectedSpell,
+            ready = ready,
+            enabled = selectedSpell ~= '',
+        },
+
+        gems = gems,
+    }
 end
 
---[[--------------------------------------------------------------------------
-  state.acquisitionScan()
+return state
 
-  WHAT  : Executes one safe Spell Acquisition preview scan.
-  WHY   : Acquisition scans must occur on the main loop, never in ImGui.
-  WHERE : ACQUISITION_SCAN handler.
-  HOW   : Delegates to acquisition.scan then moves to review state.
-  WHEN  : Once for every explicit acquisition scan request.
-----------------------------------------------------------------------------]]
-function state.acquisitionScan()
-    acquisition.scan() -- Build attributed safe preview plan.
-    runtime.setState(runtime.STATE.ACQUISITION_REVIEW, acquisition.plan.message) -- Wait for operator review.
-end
+--[[
+==============================================================================
+FOOTER : magfarm/state.lua
 
---[[--------------------------------------------------------------------------
-  state.acquisitionReview()
+EXPORT :
+  capture(readinessSpell)
 
-  WHAT  : Holds the completed preview plan for operator review.
-  WHY   : Version 0.1 must never purchase or scribe automatically.
-  WHERE : ACQUISITION_REVIEW handler.
-  HOW   : Keeps state stable and refreshes status facts only.
-  WHEN  : Until operator pauses/stops/resumes or requests another scan.
-----------------------------------------------------------------------------]]
-function state.acquisitionReview()
-    state.refreshStatus() -- Keep supporting status current while reviewing plan.
-end
+GROUP ROLE FIELDS :
+  Leader
+  MainTank
+  MainAssist
+  Puller
+  MarkNpc
+  MasterLooter
 
--- WHAT : State-to-handler dispatch map.
--- WHY  : Makes missing behaviors obvious and keeps state.tick concise.
--- WHERE: Read by state.tick.
--- HOW  : Keys match runtime.STATE values.
--- WHEN : Every active loop pass.
-local HANDLERS = { -- One handler per active state.
-    [runtime.STATE.PREPARE] = state.prepare, -- Preflight route.
-    [runtime.STATE.MANUAL] = state.manual, -- Read-only manual state.
-    [runtime.STATE.CAMP_IDLE] = state.campIdle, -- Staged camp foundation.
-    [runtime.STATE.FOLLOW] = state.follow, -- Staged follow foundation.
-    [runtime.STATE.ACQUISITION_SCAN] = state.acquisitionScan, -- One-shot scan state.
-    [runtime.STATE.ACQUISITION_REVIEW] = state.acquisitionReview, -- Review holding state.
-} -- IDLE and PAUSED intentionally have no active handlers.
+UNKNOWN-DATA POLICY :
+  Missing numeric resources remain nil.
+  Missing role readings remain nil with rolesKnown[key] == false.
+  Numeric zero is preserved as a reported value.
+  No unsupported role is silently described as unassigned.
 
---[[--------------------------------------------------------------------------
-  state.tick()
+SAFETY :
+  Read-only collection only.
+  No commands, assignment changes, or Raid TLO access.
 
-  WHAT  : Advances MagFarm by one short state-machine action.
-  WHY   : One small action per main-loop pass keeps UI and operator controls responsive.
-  WHERE : Called by init.lua main loop.
-  HOW   : Returns in Idle/Paused/not-running states; otherwise executes mapped
-          handler under pcall and pauses visibly on unexpected Lua errors.
-  WHEN  : Roughly every 100 ms while package is loaded.
-----------------------------------------------------------------------------]]
-function state.tick()
-    if not runtime.running then return end -- Idle packages need no work.
-    if runtime.state == runtime.STATE.IDLE or runtime.state == runtime.STATE.PAUSED then return end -- Explicit inactive states stay inert.
-    local handler = HANDLERS[runtime.state] -- Resolve active handler.
-    if not handler then state.pause('No handler exists for state ' .. tostring(runtime.state)) return end -- Fail visibly rather than silently.
-    local ok, err = pcall(handler) -- Contain module errors so UI remains usable.
-    if not ok then state.pause('State error: ' .. tostring(err)) end -- Preserve error reason for operator review.
-end
-
-return state -- Export lifecycle controls.
-
---[[==========================================================================
-  END OF FILE : magfarm/state.lua
-
-  EXPORTS
-    refreshStatus()             Refresh read-only module facts.
-    start()/stop(reason)        Run lifecycle.
-    pause(reason)/resume()      Suspend and restore state.
-    setMode(mode)               Select Manual/Camp/Follow.
-    setCamp()                   Save current position.
-    requestAcquisitionScan()    Start safe acquisition preview.
-    tick()                      Advance one state-machine action.
-
-  DEPENDENCIES : mq, magfarm config/runtime/utils/spells/assist/pet/merc/follow/acquisition.
-
-  HOW TO EDIT SAFELY
-    - Add a runtime.STATE constant before adding a handler here.
-    - Keep handlers short; long jobs must be decomposed into states.
-    - UI must request actions through these functions, never duplicate logic.
-==========================================================================]]--
+END OF FILE
+==============================================================================
+]]--

@@ -1,0 +1,40 @@
+MagFarm v0.3.6 - local candidate operating and review notes
+Date: 2026-10-06
+
+WHAT: Use the locally tested readiness candidate and its documentation update.
+WHY: Preserve the tested code while recording exact test coverage and limitations.
+WHERE: Active MacroQuest Lua scripts directory, magfarm package folder.
+HOW: Readiness installer supplies code; documentation updater supplies notes only.
+WHEN: Following the October 6 local validation checkpoint, before commit/push.
+
+1. Do not rerun old readiness/save-diagnostics/setup installers over this candidate.
+2. Current code files: init.lua, ui.lua, movement.lua, readiness.lua, config.lua,
+   state.lua. config.lua/state.lua and existing settings were not changed by readiness.
+3. Start in EverQuest chat with /lua run magfarm. Stop with /lua stop magfarm.
+   Enter each command separately; do not paste a sequence into one chat submission.
+4. Startup Readiness is read-only unless an operator clicks an optional Load button.
+   Missing optional components do not block the monitor. A missing ImGui binding
+   prevents the UI and reports a descriptive startup error; that error path is untested.
+5. Load buttons queue /plugin <allowlisted name> load noauto. There is no automatic
+   load or unload. The plugin may execute its own initialization.
+6. Stop All Movement covers only confirmed available EasyFind, Nav and MoveUtils
+   cancellation components. It does not cover native follow/other controllers.
+   Dispatch counts are not proof of actual stopped movement.
+7. Current readiness and the retained last-action header have different meanings.
+   The complete last-action result is in Activity Log/console if clipped in the header.
+8. Activity Log remains fixed-height and scrolling. Resizing is deferred.
+9. The documentation updater backs up existing documentation, verifies the expected
+   repository/branch/docs baseline and checks Lua content is unchanged before/after.
+10. It updates README.md, ARCHITECTURE.md, COMPATIBILITY.md and CHANGELOG.md, adds
+    TESTING-v0.3.6.md and this file, and preserves prior baseline notes/history.
+11. Review its git status and diff summary before staging/committing/pushing.
+    Do not use git reset, reclone, or blindly stage unrelated files.
+12. The current working branch remains monitor-baseline-v0.3.5. Candidate source
+    version 0.3.6 does not require an automatic branch rename or merge to main.
+13. No automated Lua runtime test is claimed. The local screenshot-supported
+    validation and untested cases are enumerated in TESTING-v0.3.6.md.
+
+FOOTER: INSTALL-v0.3.6.txt
+No gameplay changes are made by the documentation updater.
+No commit, push, tag or release occurs until separately reviewed and approved.
+END OF FILE
