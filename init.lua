@@ -1,7 +1,7 @@
 --[[==========================================================================
-  FILE        : magfarm/init.lua
+  FILE        : init.lua
   PACKAGE     : MagFarm (MacroQuest / EverQuest)
-  VERSION     : 0.3.5
+  VERSION     : 0.3.6
 
   WHAT  : MagFarm entry point. Registers the ImGui window and /magfarm command,
           then keeps the read-only monitor package alive until stopped.
@@ -21,17 +21,25 @@
           exit, or leaving the in-game world.
 
   SAFETY:
-    Version 0.3.5 is a monitor. It never starts travel, navigation, combat,
-    targeting, pet commands, casting, looting, or inventory actions.
-    Its only state-changing control is Stop All Movement.
+    Version 0.3.6 is a monitor. It never starts travel, navigation, combat,
+    targeting, casting, looting, or inventory actions automatically.
+    Manual safety controls and explicit optional-plugin loading are supported.
 ==========================================================================]]--
 
 local mq = require('mq')
+local readiness = require('magfarm.readiness')
+-- WHAT: Verify core bindings before UI loading; WHY: produce a clear startup error.
+-- WHERE: Entry-point module load; HOW: protected readiness initialization.
+-- WHEN: Once, before requiring UI; no plugin is loaded automatically.
+local bindingsReady, bindingsError = readiness.initialize()
+if not bindingsReady then
+    error('[MagFarm] Cannot open UI: ImGui Lua bindings unavailable: ' .. tostring(bindingsError))
+end
 local ui = require('magfarm.ui')
 local config = require('magfarm.config')
 
 --- Package version shown in the startup message and UI footer.
-local VERSION = '0.3.5'
+local VERSION = '0.3.6'
 
 --- Controls the main loop lifetime.
 local running = true
@@ -156,7 +164,7 @@ end
 shutdown()
 
 --[[==========================================================================
-  FOOTER : magfarm/init.lua
+  FOOTER : init.lua
 
   STARTUP
     /lua run magfarm
@@ -172,10 +180,14 @@ shutdown()
   SAFETY SCOPE
     - Reads character, pet, target, casting, and spell-gem status.
     - Can stop already-active travel/navigation/sticking.
-    - Does not start movement, cast spells, command pets, change targets,
+    - Pet Back Off and Pet Follow remain explicit UI recovery controls.
+    - Optional plugin loads require an explicit click; never unloads plugins.
+    - Does not automatically start movement, cast spells, change targets,
       attack, loot, or perform any autonomous gameplay action.
 
   DEPENDENCIES
     mq
     magfarm.ui
+    magfarm.config
+    magfarm.readiness
 ==========================================================================]]--

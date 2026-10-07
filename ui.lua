@@ -2,11 +2,11 @@
 ==============================================================================
 FILE    : ui.lua
 PACKAGE : MagFarm
-VERSION : 0.3.5
+VERSION : 0.3.6
 
 WHAT :
 Displays the monitor, independent stacked group roles, configurable resource
-colours, and a button-accessible persistent Options window.
+colours, persistent Options, and cached startup/plugin readiness.
 
 WHY :
 Group roles must be flexible. Resource thresholds must be configurable through
@@ -14,7 +14,7 @@ one settings source rather than scattered constants.
 
 WHERE :
 Registered by the existing magfarm/init.lua.
-Requires magfarm.config, magfarm.state, and magfarm.movement.
+Requires magfarm.config, magfarm.state, magfarm.movement, and magfarm.readiness.
 
 HOW :
 Captures one snapshot per visible frame. Displays a content-sized roster table.
@@ -42,6 +42,7 @@ Future behavior settings will use separate categories and explicit permissions.
 
 SAFETY :
 Only existing explicit Stop All Movement, Pet Back Off, and Pet Follow commands.
+Explicit optional-plugin loads require clicks; no automatic plugin changes.
 No role assignment, automatic engagement, casting, targeting, or Raid TLO reads.
 ==============================================================================
 ]]--
@@ -51,6 +52,7 @@ local ImGui = require('ImGui')
 local movement = require('magfarm.movement')
 local state = require('magfarm.state')
 local config = require('magfarm.config')
+local readiness = require('magfarm.readiness')
 
 local ui = {}
 ui.open = true
@@ -59,7 +61,7 @@ ui.open = true
 local optionsOpen = false
 local readinessSpell = 'Spear of Molten Arcronite'
 local lastAction = 'Monitor active. No automation is enabled.'
-local VERSION = '0.3.5'
+local VERSION = '0.3.6'
 
 --- Explicit manual requests consumed by tick().
 local stopAllRequested = false
@@ -156,11 +158,11 @@ end
 --[[
 ------------------------------------------------------------------------------
 FUNCTION : logEvent(message)
-WHAT : Records one timestamped manual-action event.
+WHAT : Records one timestamped readiness, settings, or explicit manual-action event.
 WHY : Provides a bounded audit trail.
-WHERE : Request functions and tick().
+WHERE : Manual request functions and the readiness/settings drains in tick().
 HOW : Appends using mq.gettime() and trims oldest entries.
-WHEN : Manual actions are queued or dispatched.
+WHEN : A manual request, readiness transition, or settings diagnostic is recorded.
 ------------------------------------------------------------------------------
 ]]
 local function logEvent(message)
@@ -221,15 +223,20 @@ end
 --[[
 ------------------------------------------------------------------------------
 FUNCTION : ui.tick()
-WHAT : Flushes settings, records their diagnostics, and dispatches manual requests.
+WHAT : Processes readiness requests, records diagnostics, saves settings, and dispatches manual actions.
 WHY : Keeps command side effects outside rendering.
 WHERE : Existing main loop.
-HOW : Flushes, drains settings events once, then invokes queued movement helpers.
+HOW : Ticks readiness, drains readiness events once, flushes/drains settings,
+      then dispatches queued movement/pet requests outside rendering.
 WHEN : Each package-loop pass.
 SAFETY : No observed state can initiate an action.
 ------------------------------------------------------------------------------
 ]]
 function ui.tick()
+    readiness.tick()
+    for _, event in ipairs(readiness.drainEvents()) do
+        logEvent(event)
+    end
     config.flush()
     -- WHAT: Consume settings results once; WHY: make saves visible in the log.
     -- WHERE: Main-loop tick; HOW: drain the bounded queue; WHEN: after flush.
@@ -238,9 +245,8 @@ function ui.tick()
     end
     if stopAllRequested then
         stopAllRequested = false
-        movement.stopAll()
-        lastAction = 'Stop All Movement sent.'
-        logEvent('Stop All Movement commands sent.')
+        lastAction = movement.stopAll()
+        logEvent(lastAction)
     end
     if petBackOffRequested then
         petBackOffRequested = false
@@ -557,13 +563,48 @@ local function drawHeader(snapshot)
         snapshot.character.class, snapshot.character.zone
     ))
 
+    ImGui.BeginDisabled(readiness.stopCount() == 0)
     if ImGui.Button('Stop All Movement', 180, 0) then
         ui.requestStopAllMovement()
     end
-    tooltip('Stops existing travel, navigation, and sticking. Never starts movement.')
+    ImGui.EndDisabled()
+    tooltip('Best-effort stop for loaded EasyFind/Nav/MoveUtils components only. Does not stop native follow or other automation. Never starts movement.')
     ImGui.SameLine()
     textColored(COLOR_WARN, lastAction)
     ImGui.Separator()
+end
+
+--[[
+FUNCTION: drawReadiness()
+WHAT: Show startup dependencies, current stop coverage and manual load controls
+WHY: Missing optional plugins must be visible without blocking the monitor
+WHERE: Main monitor between the summary and Character panels
+HOW: Render cached rows; queue refresh/load requests; never query or load in render
+WHEN: Each visible frame; details expand only when the operator opens the panel
+SAFETY: Plugin presence is not proof of an active conflict or command outcome
+]]
+local function drawReadiness()
+    local count = readiness.stopCount()
+    textColored(count == 3 and COLOR_GOOD or COLOR_WARN,
+        string.format('Readiness: %d/3 movement-stop components available', count))
+    if not ImGui.CollapsingHeader('Startup Readiness##magfarm_readiness') then return end
+    ImGui.Text('ImGui Lua bindings: ' .. (readiness.bindingsReady() and 'Available' or 'Unavailable'))
+    if ImGui.Button('Refresh readiness') then readiness.requestRefresh() end
+    tooltip('Queues a read-only plugin check in the main loop.')
+    for _, row in ipairs(readiness.getRows()) do
+        ImGui.TextWrapped(row.name .. ': ' .. row.label .. ' - ' .. row.purpose)
+        if row.detail ~= '' then textColored(COLOR_WARN, row.detail) end
+        if row.loadable then
+            ImGui.BeginDisabled(row.loaded)
+            if ImGui.Button('Load ' .. row.name .. '##magfarm_load_' .. row.name) then
+                readiness.requestLoad(row.name)
+            end
+            ImGui.EndDisabled()
+            tooltip('/plugin ' .. row.name .. ' load noauto. Explicit session-only load; the plugin may execute its own initialization.')
+        end
+    end
+    ImGui.TextWrapped('Plugins are never loaded or unloaded automatically. Unknown reads do not enable their commands. Missing optional movement plugins do not disable pet controls.')
+    ImGui.TextWrapped('Conflict status is not established by presence alone. MQ2Melee or other automation may control movement; MagFarm does not disable it or claim exclusive control.')
 end
 
 --[[
@@ -709,7 +750,7 @@ end
 --[[
 ------------------------------------------------------------------------------
 FUNCTION : drawLog()
-WHAT : Displays bounded manual-action and settings history.
+WHAT : Displays bounded readiness, manual-action, and settings history.
 WHY : Keeps package-originated actions auditable.
 WHERE : Activity Log panel.
 HOW : Uses a child region and always balances BeginChild/EndChild.
@@ -753,6 +794,7 @@ function ui.render()
             local snapshot = state.capture(readinessSpell)
             drawHeader(snapshot)
             drawSummary(snapshot)
+            drawReadiness()
             ImGui.Separator()
             drawCharacter(snapshot)
             ImGui.Separator()
@@ -784,7 +826,7 @@ return ui
 --[[
 ==============================================================================
 FOOTER : ui.lua
-VERSION : 0.3.5
+VERSION : 0.3.6
 
 EXPORTS :
   open
@@ -821,7 +863,8 @@ OPTIONS :
   Persistence implemented; save time, values, counter and pending status shown.
   Activity Log receives edit, reset, load, save and failure events once per tick.
   Save counters and activity history reset when the Lua package restarts.
-  No gameplay behavior controls added.
+  Explicit optional-plugin load controls added under Startup Readiness.
+  No automatic gameplay behavior added.
 
 SAFETY :
   Existing explicit manual controls only.

@@ -1,5 +1,48 @@
 # MagFarm changelog
 
+## 0.3.6 - 2026-10-06 - Local validation checkpoint; publication pending
+
+### Added
+- Documented readiness.lua module with protected inventory reads, cached
+  Loaded/Not loaded/Unknown states and explicit optional-plugin load requests.
+- Startup Readiness panel, ImGui-binding verification and observation-only
+  MQ2Melee status; plugin presence is not asserted to be an active conflict.
+- Explicit EasyFind/Nav/MoveUtils Load buttons using documented load noauto.
+- Bounded readiness transition and load-request/dispatch/result logging.
+
+### Changed
+- Stop All Movement refreshes dependencies and independently dispatches available
+  components, reporting absent/unknown names and protected dispatch failures.
+- UI stop control remains available for partial coverage and is gated at zero
+  confirmed components; pet recovery is independent of movement prerequisites.
+- Entry point verifies ImGui availability before requiring the UI.
+
+### Public identity and comment cleanup
+- Replaced identifying test-character/pet references in comments and archived
+  compatibility notes with anonymous descriptions. In-game identities unchanged.
+- Updated UI dependency/event descriptions and stop-dispatch wording; Lua
+  executable tokens unchanged by this comment-only code cleanup.
+- Documented the publication identity policy. History remains a separate audit
+  and approval task; current-file redaction does not erase prior commits.
+
+### Preserved
+- No automatic plugin loading/unloading or gameplay automation.
+- Existing character settings, config.lua and state.lua.
+- Fixed-height scrolling Activity Log; resizing deferred as a future request.
+
+### Validation
+- Loaded detection, EasyFind-missing startup, GUI recovery for all three optional
+  components, all-loaded idle dispatch and each one-missing idle dispatch were
+  observed in user-provided client screenshots.
+- Test record distinguishes observations from active-movement cancellation,
+  unknown telemetry, all-missing and failed-load cases, which were not tested.
+- README, architecture, compatibility, install notes and test record updated.
+- This entry does not claim a commit, push, tag or public release exists.
+
+## Previous changelog (preserved)
+
+# MagFarm changelog
+
 This record covers the current monitor branch. It replaces outdated legacy-attempt notes; it does not reconstruct historical releases or announce a new release/tag.
 
 ## 2026-10-06 - v0.3.5 save diagnostics

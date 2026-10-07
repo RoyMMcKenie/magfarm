@@ -1,7 +1,7 @@
 --[[==========================================================================
-  FILE        : magfarm/movement.lua
+  FILE        : movement.lua
   PACKAGE     : MagFarm (MacroQuest / EverQuest)
-  VERSION     : 0.2.0
+  VERSION     : 0.3.6
 
   WHAT  : Owns MagFarm's explicit manual safety and recovery commands:
           Stop All Movement, Pet Back Off, and Pet Follow.
@@ -13,10 +13,11 @@
   WHERE : Called by ui.tick() after the operator requests an action through
           a MagFarm button or slash command.
 
-  HOW   : Sends only commands verified live on 112 MAG and summoned pet:
+  HOW   : Sends cancellation/recovery commands tested with a 112 MAG
+          and its summoned pet:
           /travelto stop, /nav stop, /stick off, /pet back off, and /pet follow.
 
-  WHEN  : Only after an explicit operator request. Version 0.2.0 never decides
+  WHEN  : Only after an explicit operator request. Version 0.3.6 never decides
           to issue these commands automatically.
 
   SAFETY:
@@ -26,8 +27,21 @@
 ==========================================================================]]--
 
 local mq = require('mq')
+local readiness = require('magfarm.readiness')
 
 local movement = {}
+
+--[[
+FUNCTION: sendStop(command)
+WHAT: Send one existing movement-cancellation command
+WHY: Give each component a protected dispatch so another can still be attempted
+WHERE: movement.stopAll through pcall
+HOW: Invoke mq.cmd with one fixed, source-defined command
+WHEN: Only after an explicit operator stop request and a confirmed dependency
+]]
+local function sendStop(command)
+    mq.cmd(command)
+end
 
 --[[--------------------------------------------------------------------------
   movement.stopAll()
@@ -40,17 +54,32 @@ local movement = {}
 
   WHERE : Called from ui.tick after a user requests Stop All Movement.
 
-  HOW   : Sends the three independently verified stop commands in a fixed
-          defensive order: travel, navigation, then sticking.
+  HOW   : Checks readiness and sends only available stop components in fixed
+          order: travel, navigation, then sticking; reports partial dispatch.
 
   WHEN  : Only when the operator explicitly requests the action.
 ----------------------------------------------------------------------------]]
 function movement.stopAll()
-    mq.cmd('/travelto stop')
-    mq.cmd('/nav stop')
-    mq.cmd('/stick off')
-
-    mq.cmd('/echo [MagFarm] Stop All Movement requested: travel, nav, stick.')
+    readiness.refresh()
+    local components = {
+        {name='MQ2EasyFind', command='/travelto stop'},
+        {name='MQ2Nav', command='/nav stop'},
+        {name='MQ2MoveUtils', command='/stick off'},
+    }
+    local sent, skipped, failed = 0, {}, {}
+    for _, component in ipairs(components) do
+        if readiness.isLoaded(component.name) then
+            local ok = pcall(sendStop, component.command)
+            if ok then sent = sent + 1 else table.insert(failed, component.name) end
+        else
+            table.insert(skipped, component.name)
+        end
+    end
+    local message = string.format('Stop request: %d/3 commands dispatched.', sent)
+    if #skipped > 0 then message = message .. ' Skipped (missing/unknown): ' .. table.concat(skipped, ', ') .. '.' end
+    if #failed > 0 then message = message .. ' Dispatch failed: ' .. table.concat(failed, ', ') .. '.' end
+    mq.cmd('/echo [MagFarm] ' .. message)
+    return message
 end
 
 --[[--------------------------------------------------------------------------
@@ -66,7 +95,7 @@ end
   HOW   : Issues the live-verified /pet back off command.
 
   WHEN  : Only after an explicit operator request. MagFarm never sends this
-          command automatically in version 0.2.0.
+          command automatically in version 0.3.6.
 ----------------------------------------------------------------------------]]
 function movement.petBackOff()
     mq.cmd('/pet back off')
@@ -86,7 +115,7 @@ end
   HOW   : Issues the live-verified /pet follow command.
 
   WHEN  : Only after an explicit operator request. MagFarm never sends this
-          command automatically in version 0.2.0.
+          command automatically in version 0.3.6.
 ----------------------------------------------------------------------------]]
 function movement.petFollow()
     mq.cmd('/pet follow')
@@ -96,10 +125,11 @@ end
 return movement
 
 --[[==========================================================================
-  FOOTER : magfarm/movement.lua
+  FOOTER : movement.lua
 
   EXPORTS
-    stopAll()      Stop EasyFind, MQ2Nav, and MQ2MoveUtils movement.
+    stopAll()      Best-effort cancellation for confirmed available components.
+                   Returns dispatch summary; not proof all movement stopped.
     petBackOff()   Tell the current pet to stop attacking.
     petFollow()    Tell the current pet to follow its owner.
 
@@ -109,6 +139,10 @@ return movement
     /stick off
     /pet back off
     /pet follow
+
+  READINESS
+    Missing/unknown components are skipped; available commands are attempted.
+    Native follow, other automation and unlisted movement systems are not covered.
 
   SAFETY
     This module never starts travel, navigation, stick, combat, pet attack,
